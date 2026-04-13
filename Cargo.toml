@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "libffmpeg-video-sys",
+    "video-codec",
+    "video-engine",
+]
+resolver = "2"

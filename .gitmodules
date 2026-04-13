@@ -1,0 +1,6 @@
+[submodule "libffmpeg-video-sys/vendor/ffmpeg"]
+	path = libffmpeg-video-sys/vendor/ffmpeg
+	url = https://git.ffmpeg.org/ffmpeg.git
+[submodule "libffmpeg-video-sys/vendor/opus"]
+	path = libffmpeg-video-sys/vendor/opus
+	url = https://gitlab.xiph.org/xiph/opus.git

@@ -1,0 +1,11 @@
+[package]
+name = "video-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Safe Rust wrapper around FFmpeg for video decode, scale, and JPEG encode"
+
+[dependencies]
+libffmpeg-video-sys = { path = "../libffmpeg-video-sys" }
+video-codec = { path = "../video-codec" }
+bytes = "1"

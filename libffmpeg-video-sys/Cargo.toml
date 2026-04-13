@@ -1,0 +1,20 @@
+[package]
+name = "libffmpeg-video-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Raw FFI bindings to FFmpeg libavcodec/libavutil/libswscale for video decode, scale, JPEG encode, and audio encode (Opus/MP2/AC-3)"
+links = "avcodec"
+
+[features]
+default = []
+# Use system-installed FFmpeg libraries instead of vendored build
+system-ffmpeg = []
+
+[lib]
+doctest = false
+
+[build-dependencies]
+bindgen = "0.72.1"
+cmake = "0.1.58"
+pkg-config = "0.3.32"
