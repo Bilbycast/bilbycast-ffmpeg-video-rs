@@ -198,9 +198,17 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     let extra_ldflags = format!("-L{}", opus_lib.display());
 
     let opus_pkgconfig = opus_lib.join("pkgconfig");
+    if !opus_pkgconfig.join("opus.pc").exists() {
+        panic!(
+            "opus.pc not found at {}. Vendored libopus did not install its pkg-config module.",
+            opus_pkgconfig.display()
+        );
+    }
+    eprintln!("cargo:warning=Using PKG_CONFIG_PATH={}", opus_pkgconfig.display());
     let status = Command::new(&configure_path)
         .current_dir(&build_dir)
         .env("PKG_CONFIG_PATH", &opus_pkgconfig)
+        .env("PKG_CONFIG_LIBDIR", &opus_pkgconfig)
         .args([
             &format!("--prefix={}", install_dir.display()),
             "--disable-everything",
