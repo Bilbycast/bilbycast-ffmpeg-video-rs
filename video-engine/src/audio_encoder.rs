@@ -55,7 +55,7 @@ impl AudioEncoder {
             let codec_ptr = match config.codec {
                 AudioCodecType::Opus => {
                     // Use libopus encoder (higher quality than FFmpeg native)
-                    avcodec_find_encoder_by_name(b"libopus\0".as_ptr() as *const i8)
+                    avcodec_find_encoder_by_name(b"libopus\0".as_ptr() as *const std::os::raw::c_char)
                 }
                 AudioCodecType::Mp2 => {
                     avcodec_find_encoder(AVCodecID_AV_CODEC_ID_MP2)
