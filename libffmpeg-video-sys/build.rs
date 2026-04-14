@@ -150,7 +150,7 @@ fn build_opus(out_dir: &PathBuf) -> PathBuf {
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("OPUS_BUILD_PROGRAMS", "OFF")
         .define("OPUS_BUILD_TESTING", "OFF")
-        .define("OPUS_INSTALL_PKG_CONFIG_MODULE", "OFF")
+        .define("OPUS_INSTALL_PKG_CONFIG_MODULE", "ON")
         .define("OPUS_INSTALL_CMAKE_CONFIG_MODULE", "OFF")
         .define("CMAKE_INSTALL_PREFIX", install_dir.to_str().unwrap())
         .build();
@@ -197,8 +197,10 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     let extra_cflags = format!("-I{}", opus_include.display());
     let extra_ldflags = format!("-L{}", opus_lib.display());
 
+    let opus_pkgconfig = opus_lib.join("pkgconfig");
     let status = Command::new(&configure_path)
         .current_dir(&build_dir)
+        .env("PKG_CONFIG_PATH", &opus_pkgconfig)
         .args([
             &format!("--prefix={}", install_dir.display()),
             "--disable-everything",
