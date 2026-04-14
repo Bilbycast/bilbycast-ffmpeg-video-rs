@@ -204,20 +204,6 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             opus_pkgconfig.display()
         );
     }
-    eprintln!("cargo:warning=Using PKG_CONFIG_PATH={}", opus_pkgconfig.display());
-
-    // Sanity check: run pkg-config directly with the same env we're about to pass
-    // to configure, to verify env propagation works.
-    let pc_check = Command::new("pkg-config")
-        .env("PKG_CONFIG_PATH", &opus_pkgconfig)
-        .args(["--exists", "--print-errors", "opus"])
-        .status();
-    match pc_check {
-        Ok(s) if s.success() => eprintln!("cargo:warning=pkg-config --exists opus: OK"),
-        Ok(s) => panic!("pkg-config --exists opus failed (status {s}) despite PKG_CONFIG_PATH set"),
-        Err(e) => panic!("failed to run pkg-config: {e}"),
-    }
-
     let status = Command::new(&configure_path)
         .current_dir(&build_dir)
         .env("PKG_CONFIG_PATH", &opus_pkgconfig)
@@ -248,6 +234,8 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             // Static only
             "--enable-static",
             "--disable-shared",
+            // Needed so --libs returns Libs.private (e.g. -lm for static libopus)
+            "--pkg-config-flags=--static",
             // Opus include/lib paths
             &format!("--extra-cflags={extra_cflags}"),
             &format!("--extra-ldflags={extra_ldflags}"),
