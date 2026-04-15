@@ -8,8 +8,23 @@ links = "avcodec"
 
 [features]
 default = []
-# Use system-installed FFmpeg libraries instead of vendored build
+# Use system-installed FFmpeg libraries instead of vendored build.
 system-ffmpeg = []
+# Enable libx264 H.264 video encoding. Forces the vendored FFmpeg build
+# to link against system-installed libx264 (via pkg-config) with
+# `--enable-gpl --enable-libx264`, which converts the resulting FFmpeg
+# library — and therefore any bilbycast-edge binary that links it — to
+# GPL v2+. Default is off; operators who need x264 transcoding must opt
+# in explicitly (and accept the licence implications).
+video-encoder-x264 = []
+# Enable libx265 HEVC video encoding. Same licensing implications as
+# `video-encoder-x264` (GPL v2+). Default is off.
+video-encoder-x265 = []
+# Enable NVENC hardware H.264/HEVC encoding. Royalty-free at the API
+# layer but requires the NVIDIA proprietary driver at runtime and is
+# typically built with `--enable-nonfree` at the FFmpeg layer. Default
+# is off — available as a future opt-in.
+video-encoder-nvenc = []
 
 [lib]
 doctest = false

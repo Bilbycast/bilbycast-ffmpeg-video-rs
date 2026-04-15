@@ -21,12 +21,14 @@ pub mod decoder;
 pub mod encoder;
 pub mod scaler;
 pub mod thumbnail;
+pub mod video_encoder;
 
 pub use audio_encoder::AudioEncoder;
 pub use decoder::VideoDecoder;
 pub use encoder::JpegEncoder;
 pub use scaler::VideoScaler;
 pub use thumbnail::decode_thumbnail;
+pub use video_encoder::VideoEncoder;
 
 /// Silence FFmpeg's internal logging. Call once at startup.
 pub fn silence_ffmpeg_logs() {

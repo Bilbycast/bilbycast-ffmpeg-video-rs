@@ -62,6 +62,21 @@ pub enum PixelFormat {
     Yuvj444p,
     /// 10-bit YUV 4:2:0 (HEVC main 10).
     Yuv420p10le,
+    /// Planar 10-bit YUV 4:2:2, little-endian (broadcast 4:2:2 P10).
+    Yuv422p10le,
+}
+
+/// Destination pixel format for [`VideoScaler`]. Lets callers select between
+/// the existing thumbnail-oriented YUVJ420P default and planar broadcast
+/// formats required by RFC 4175 packetizers (ST 2110-20 / -23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalerDstFormat {
+    /// Planar YUV 4:2:0, full-range. Existing default (MJPEG-compatible).
+    Yuvj420p,
+    /// Planar YUV 4:2:2, 8-bit. Broadcast-range.
+    Yuv422p8,
+    /// Planar YUV 4:2:2, 10-bit little-endian. Broadcast 10-bit.
+    Yuv422p10le,
 }
 
 /// Configuration for thumbnail generation.
@@ -161,6 +176,188 @@ pub enum AudioError {
 
     /// Invalid input parameters.
     #[error("invalid audio input: {0}")]
+    InvalidInput(String),
+}
+
+// ── Video encoder types ─────────────────────────────────────────────────
+
+/// Encoder backend for H.264 / HEVC video compression.
+///
+/// The availability of each backend depends on the build configuration:
+/// - `X264` requires the `video-encoder-x264` feature (GPL v2+).
+/// - `X265` requires the `video-encoder-x265` feature (GPL v2+).
+/// - `H264Nvenc` / `HevcNvenc` require the `video-encoder-nvenc` feature
+///   and an NVIDIA GPU with a suitable driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoderCodec {
+    /// libx264 → H.264 (Advanced Video Coding).
+    X264,
+    /// libx265 → HEVC (H.265).
+    X265,
+    /// NVENC H.264 hardware encoder.
+    H264Nvenc,
+    /// NVENC HEVC hardware encoder.
+    HevcNvenc,
+}
+
+impl VideoEncoderCodec {
+    /// The codec family produced on the wire, irrespective of backend.
+    pub fn family(self) -> VideoCodec {
+        match self {
+            VideoEncoderCodec::X264 | VideoEncoderCodec::H264Nvenc => VideoCodec::H264,
+            VideoEncoderCodec::X265 | VideoEncoderCodec::HevcNvenc => VideoCodec::Hevc,
+        }
+    }
+
+    /// FFmpeg encoder name passed to `avcodec_find_encoder_by_name`.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            VideoEncoderCodec::X264 => "libx264",
+            VideoEncoderCodec::X265 => "libx265",
+            VideoEncoderCodec::H264Nvenc => "h264_nvenc",
+            VideoEncoderCodec::HevcNvenc => "hevc_nvenc",
+        }
+    }
+}
+
+impl std::fmt::Display for VideoEncoderCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.ffmpeg_name())
+    }
+}
+
+/// Encoder speed / quality preset. Semantics mirror libx264/x265 presets;
+/// NVENC maps them onto the nearest equivalent `-preset` internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoPreset {
+    Ultrafast,
+    Superfast,
+    Veryfast,
+    Faster,
+    Fast,
+    #[default]
+    Medium,
+    Slow,
+    Slower,
+    Veryslow,
+}
+
+impl VideoPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ultrafast => "ultrafast",
+            Self::Superfast => "superfast",
+            Self::Veryfast => "veryfast",
+            Self::Faster => "faster",
+            Self::Fast => "fast",
+            Self::Medium => "medium",
+            Self::Slow => "slow",
+            Self::Slower => "slower",
+            Self::Veryslow => "veryslow",
+        }
+    }
+}
+
+/// H.264/HEVC profile target. `Auto` lets the encoder pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoProfile {
+    #[default]
+    Auto,
+    Baseline,
+    Main,
+    High,
+}
+
+impl VideoProfile {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Baseline => Some("baseline"),
+            Self::Main => Some("main"),
+            Self::High => Some("high"),
+        }
+    }
+}
+
+/// Configuration for a single video encoder instance.
+#[derive(Debug, Clone)]
+pub struct VideoEncoderConfig {
+    /// Which backend to use. Must match a compiled-in feature flag.
+    pub codec: VideoEncoderCodec,
+    /// Output frame width in pixels.
+    pub width: u32,
+    /// Output frame height in pixels.
+    pub height: u32,
+    /// Frame rate numerator (e.g. 30000 for 29.97 fps).
+    pub fps_num: u32,
+    /// Frame rate denominator (e.g. 1001 for 29.97 fps).
+    pub fps_den: u32,
+    /// Target average bitrate in kbps.
+    pub bitrate_kbps: u32,
+    /// Keyframe interval (GOP size) in frames.
+    pub gop_size: u32,
+    /// Speed / quality preset.
+    pub preset: VideoPreset,
+    /// Profile target.
+    pub profile: VideoProfile,
+    /// Emit SPS/PPS (or VPS/SPS/PPS) as a separate extradata blob
+    /// instead of inside the bitstream. Required for RTP / RTMP / MP4.
+    pub global_header: bool,
+}
+
+impl Default for VideoEncoderConfig {
+    fn default() -> Self {
+        Self {
+            codec: VideoEncoderCodec::X264,
+            width: 1280,
+            height: 720,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 4000,
+            gop_size: 60,
+            preset: VideoPreset::default(),
+            profile: VideoProfile::default(),
+            global_header: true,
+        }
+    }
+}
+
+/// One encoded video frame emitted by a [`VideoEncoder`].
+#[derive(Debug, Clone)]
+pub struct EncodedVideoFrame {
+    /// Compressed bitstream (Annex B NALUs for H.264/HEVC).
+    pub data: Vec<u8>,
+    /// Presentation timestamp in the encoder time base (1 / (fps_num)).
+    pub pts: i64,
+    /// Decode timestamp in the same time base (may equal `pts` when
+    /// there are no B-frames).
+    pub dts: i64,
+    /// True if this frame is an IDR / keyframe.
+    pub keyframe: bool,
+}
+
+/// Errors produced by a video encoder.
+#[derive(Debug, Error)]
+pub enum VideoEncoderError {
+    #[error("encoder not compiled in: {0}. Rebuild with the matching feature flag.")]
+    EncoderDisabled(VideoEncoderCodec),
+    #[error("encoder not found in FFmpeg: {0}")]
+    EncoderNotFound(VideoEncoderCodec),
+    #[error("failed to allocate encoder context")]
+    AllocContext,
+    #[error("failed to allocate frame")]
+    AllocFrame,
+    #[error("failed to allocate frame buffer: FFmpeg error {0}")]
+    AllocFrameBuffer(i32),
+    #[error("failed to allocate packet")]
+    AllocPacket,
+    #[error("failed to open encoder: FFmpeg error {0}")]
+    OpenCodec(i32),
+    #[error("failed to send frame to encoder: FFmpeg error {0}")]
+    SendFrame(i32),
+    #[error("failed to receive encoded packet: FFmpeg error {0}")]
+    ReceivePacket(i32),
+    #[error("invalid input: {0}")]
     InvalidInput(String),
 }
 

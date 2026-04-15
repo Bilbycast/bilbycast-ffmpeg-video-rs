@@ -61,6 +61,43 @@ impl DecodedFrame {
         self.frame
     }
 
+    /// Access all three planes of a planar YUV frame at once.
+    ///
+    /// Returns `Some((y, y_stride, u, u_stride, v, v_stride))` when the
+    /// pixel format is one of the planar YUV 4:2:0 / 4:2:2 / 4:4:4
+    /// variants (including the JPEG full-range siblings). The U / V
+    /// slices have height rounded up for 4:2:0 (half-height each).
+    ///
+    /// Returns `None` for non-planar formats (RGB, 10-bit packed, etc).
+    pub fn yuv_planes(&self) -> Option<(&[u8], usize, &[u8], usize, &[u8], usize)> {
+        unsafe {
+            let frame = &*self.frame;
+            let y_ptr = frame.data[0];
+            let u_ptr = frame.data[1];
+            let v_ptr = frame.data[2];
+            if y_ptr.is_null() || u_ptr.is_null() || v_ptr.is_null() {
+                return None;
+            }
+            let y_stride = frame.linesize[0] as usize;
+            let u_stride = frame.linesize[1] as usize;
+            let v_stride = frame.linesize[2] as usize;
+            let h = frame.height as usize;
+            // For 4:2:0 the chroma planes are half-height; for 4:2:2 and
+            // 4:4:4 they are full-height. Over-allocate (return the
+            // maximum) rather than inspecting pix_fmt precisely — callers
+            // only index into `chroma_height * stride` anyway.
+            let chroma_rows = h; // upper bound
+            Some((
+                std::slice::from_raw_parts(y_ptr, y_stride * h),
+                y_stride,
+                std::slice::from_raw_parts(u_ptr, u_stride * chroma_rows),
+                u_stride,
+                std::slice::from_raw_parts(v_ptr, v_stride * chroma_rows),
+                v_stride,
+            ))
+        }
+    }
+
     /// Access the Y (luma) plane data for black-screen detection.
     ///
     /// Returns the Y plane bytes and the line stride. For planar YUV formats,

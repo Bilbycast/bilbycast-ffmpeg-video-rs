@@ -94,6 +94,11 @@ fn main() {
         .allowlist_function("av_get_default_channel_layout")
         .allowlist_function("av_samples_get_buffer_size")
         .allowlist_function("av_channel_layout_default")
+        .allowlist_function("av_dict_set")
+        .allowlist_function("av_dict_free")
+        .allowlist_function("av_rescale_q")
+        .allowlist_type("AVDictionary")
+        .allowlist_type("AVRational")
         // ── swscale ──
         .allowlist_function("sws_getContext")
         .allowlist_function("sws_scale")
@@ -194,8 +199,8 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
 
     // Run ./configure with minimal flags
     let configure_path = source_abs.join("configure");
-    let extra_cflags = format!("-I{}", opus_include.display());
-    let extra_ldflags = format!("-L{}", opus_lib.display());
+    let mut extra_cflags = format!("-I{}", opus_include.display());
+    let mut extra_ldflags = format!("-L{}", opus_lib.display());
 
     let opus_pkgconfig = opus_lib.join("pkgconfig");
     if !opus_pkgconfig.join("opus.pc").exists() {
@@ -204,57 +209,146 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             opus_pkgconfig.display()
         );
     }
+
+    // ── Optional GPL/non-free video encoders ──
+    //
+    // These features are off by default. Enabling them links
+    // system-installed encoder libraries into the vendored FFmpeg build
+    // and — for libx264/libx265 — flips the whole FFmpeg binary to GPL.
+    // Operators must install the libraries themselves and accept the
+    // licence implications.
+    let mut configure_args: Vec<String> = vec![
+        format!("--prefix={}", install_dir.display()),
+        "--disable-everything".into(),
+        "--disable-programs".into(),
+        "--disable-doc".into(),
+        "--disable-avdevice".into(),
+        "--disable-avformat".into(),
+        "--disable-network".into(),
+        "--disable-postproc".into(),
+        "--disable-avfilter".into(),
+        "--enable-avcodec".into(),
+        "--enable-avutil".into(),
+        "--enable-swscale".into(),
+        // Video decoders
+        "--enable-decoder=h264".into(),
+        "--enable-decoder=hevc".into(),
+        // Video encoder (thumbnails)
+        "--enable-encoder=mjpeg".into(),
+        // Audio encoders
+        "--enable-libopus".into(),
+        "--enable-encoder=libopus".into(),
+        "--enable-encoder=mp2".into(),
+        "--enable-encoder=ac3".into(),
+        // Static only
+        "--enable-static".into(),
+        "--disable-shared".into(),
+        // Needed so --libs returns Libs.private (e.g. -lm for static libopus)
+        "--pkg-config-flags=--static".into(),
+        // Disable optional deps that may be detected on the system
+        "--disable-zlib".into(),
+        "--disable-bzlib".into(),
+        "--disable-lzma".into(),
+        "--disable-iconv".into(),
+        "--disable-sdl2".into(),
+        "--disable-xlib".into(),
+        "--disable-libxcb".into(),
+        "--disable-securetransport".into(),
+        "--disable-vulkan".into(),
+        "--disable-metal".into(),
+        "--disable-audiotoolbox".into(),
+        "--disable-videotoolbox".into(),
+        // Suppress assembly if nasm/yasm not available (fallback to C)
+        "--disable-x86asm".into(),
+    ];
+
+    // Aggregated pkg-config search path so FFmpeg's configure can find
+    // every enabled optional library at once.
+    let mut pkgconfig_paths: Vec<PathBuf> = vec![opus_pkgconfig.clone()];
+
+    let gpl_required = cfg!(feature = "video-encoder-x264")
+        || cfg!(feature = "video-encoder-x265");
+    if gpl_required {
+        println!("cargo:warning=libffmpeg-video-sys: GPL encoder feature enabled — the resulting FFmpeg library is GPL v2+. Any bilbycast-edge binary linking it inherits GPL terms.");
+        configure_args.push("--enable-gpl".into());
+    }
+
+    if cfg!(feature = "video-encoder-x264") {
+        let x264 = pkg_config::Config::new()
+            .probe("x264")
+            .expect(
+                "pkg-config: x264 not found. \
+                 Install libx264-dev (Debian/Ubuntu) or `brew install x264` (macOS) \
+                 to build with the video-encoder-x264 feature.",
+            );
+        for inc in &x264.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        for lp in &x264.link_paths {
+            extra_ldflags.push(' ');
+            extra_ldflags.push_str(&format!("-L{}", lp.display()));
+            pkgconfig_paths.push(lp.join("pkgconfig"));
+        }
+        configure_args.push("--enable-libx264".into());
+        configure_args.push("--enable-encoder=libx264".into());
+    }
+
+    if cfg!(feature = "video-encoder-x265") {
+        let x265 = pkg_config::Config::new()
+            .probe("x265")
+            .expect(
+                "pkg-config: x265 not found. \
+                 Install libx265-dev (Debian/Ubuntu) or `brew install x265` (macOS) \
+                 to build with the video-encoder-x265 feature.",
+            );
+        for inc in &x265.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        for lp in &x265.link_paths {
+            extra_ldflags.push(' ');
+            extra_ldflags.push_str(&format!("-L{}", lp.display()));
+            pkgconfig_paths.push(lp.join("pkgconfig"));
+        }
+        configure_args.push("--enable-libx265".into());
+        configure_args.push("--enable-encoder=libx265".into());
+    }
+
+    if cfg!(feature = "video-encoder-nvenc") {
+        // NVENC is a header-only interface plus runtime driver. The
+        // FFmpeg-side headers live in nv-codec-headers; we expect them
+        // to be discoverable by pkg-config name "ffnvcodec". `--enable-nonfree`
+        // is not strictly required for NVENC headers but is commonly
+        // combined with it in distributions.
+        let nv = pkg_config::Config::new().probe("ffnvcodec").expect(
+            "pkg-config: ffnvcodec not found. \
+             Install nv-codec-headers and the NVIDIA driver to build with \
+             the video-encoder-nvenc feature.",
+        );
+        for inc in &nv.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        configure_args.push("--enable-nvenc".into());
+        configure_args.push("--enable-encoder=h264_nvenc".into());
+        configure_args.push("--enable-encoder=hevc_nvenc".into());
+    }
+
+    // Extra cflags / ldflags must be passed last (accumulated across
+    // every optional dep above).
+    configure_args.push(format!("--extra-cflags={extra_cflags}"));
+    configure_args.push(format!("--extra-ldflags={extra_ldflags}"));
+
+    // Join all pkg-config search paths with the platform separator.
+    let joined_pkgconfig = std::env::join_paths(pkgconfig_paths.iter())
+        .expect("failed to join pkg-config paths");
+
     let status = Command::new(&configure_path)
         .current_dir(&build_dir)
-        .env("PKG_CONFIG_PATH", &opus_pkgconfig)
-        .env("PKG_CONFIG_LIBDIR", &opus_pkgconfig)
-        .args([
-            &format!("--prefix={}", install_dir.display()),
-            "--disable-everything",
-            "--disable-programs",
-            "--disable-doc",
-            "--disable-avdevice",
-            "--disable-avformat",
-            "--disable-network",
-            "--disable-postproc",
-            "--disable-avfilter",
-            "--enable-avcodec",
-            "--enable-avutil",
-            "--enable-swscale",
-            // Video decoders
-            "--enable-decoder=h264",
-            "--enable-decoder=hevc",
-            // Video encoder (thumbnails)
-            "--enable-encoder=mjpeg",
-            // Audio encoders
-            "--enable-libopus",
-            "--enable-encoder=libopus",
-            "--enable-encoder=mp2",
-            "--enable-encoder=ac3",
-            // Static only
-            "--enable-static",
-            "--disable-shared",
-            // Needed so --libs returns Libs.private (e.g. -lm for static libopus)
-            "--pkg-config-flags=--static",
-            // Opus include/lib paths
-            &format!("--extra-cflags={extra_cflags}"),
-            &format!("--extra-ldflags={extra_ldflags}"),
-            // Disable optional deps that may be detected on the system
-            "--disable-zlib",
-            "--disable-bzlib",
-            "--disable-lzma",
-            "--disable-iconv",
-            "--disable-sdl2",
-            "--disable-xlib",
-            "--disable-libxcb",
-            "--disable-securetransport",
-            "--disable-vulkan",
-            "--disable-metal",
-            "--disable-audiotoolbox",
-            "--disable-videotoolbox",
-            // Suppress assembly if nasm/yasm not available (fallback to C)
-            "--disable-x86asm",
-        ])
+        .env("PKG_CONFIG_PATH", &joined_pkgconfig)
+        .env("PKG_CONFIG_LIBDIR", &joined_pkgconfig)
+        .args(&configure_args)
         .status()
         .expect("failed to execute FFmpeg configure");
 
@@ -305,12 +399,36 @@ fn link_ffmpeg_libs(include_opus: bool) {
         println!("cargo:rustc-link-lib=static=opus");
     }
 
+    // Optional video encoder libraries. These must be findable by the
+    // system linker; the pkg-config probes above already emitted
+    // `cargo:rustc-link-search=` directives. We only have to name them
+    // here so the final rustc invocation pulls them in.
+    if cfg!(feature = "video-encoder-x264") {
+        // libx264 is typically shipped statically; prefer static but
+        // fall back to dylib lookup if the system only has .so/.dylib.
+        println!("cargo:rustc-link-lib=x264");
+    }
+    if cfg!(feature = "video-encoder-x265") {
+        println!("cargo:rustc-link-lib=x265");
+        // libx265 is C++; pull in the C++ runtime so the static link
+        // succeeds on Linux.
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os == "linux" {
+            println!("cargo:rustc-link-lib=stdc++");
+        } else if target_os == "macos" {
+            println!("cargo:rustc-link-lib=c++");
+        }
+    }
+
     // Platform-specific system libs that FFmpeg requires
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-lib=m");
             println!("cargo:rustc-link-lib=pthread");
+            if cfg!(feature = "video-encoder-nvenc") {
+                println!("cargo:rustc-link-lib=dl");
+            }
         }
         "macos" => {
             println!("cargo:rustc-link-lib=m");

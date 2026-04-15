@@ -7,16 +7,18 @@
 //! resize decoded frames to thumbnail dimensions before JPEG encoding.
 
 use libffmpeg_video_sys::*;
-use video_codec::VideoError;
+use video_codec::{ScalerDstFormat, VideoError};
 
 use crate::decoder::DecodedFrame;
 
-/// A scaled video frame ready for encoding.
+/// A scaled video frame ready for encoding or packetization.
 ///
-/// Owns its pixel data buffer. Always in YUVJ420P pixel format
-/// (full-range YUV 4:2:0, compatible with the MJPEG encoder).
+/// Owns its pixel data buffer. Pixel format depends on the scaler's
+/// destination format: YUVJ420P (legacy thumbnail path) or a planar
+/// broadcast format (4:2:2 8-bit or 10-bit LE, for RFC 4175 packetizers).
 pub struct ScaledFrame {
     pub(crate) frame: *mut AVFrame,
+    pub(crate) dst_format: ScalerDstFormat,
 }
 
 impl ScaledFrame {
@@ -26,6 +28,39 @@ impl ScaledFrame {
 
     pub fn height(&self) -> u32 {
         unsafe { (*self.frame).height as u32 }
+    }
+
+    pub fn dst_format(&self) -> ScalerDstFormat {
+        self.dst_format
+    }
+
+    /// Returns `(data, linesize)` for plane index 0..=2 (Y, U, V).
+    ///
+    /// Length of `data` is `linesize * plane_height` where `plane_height`
+    /// equals frame height for luma and (height for 4:2:2 / height/2 for 4:2:0)
+    /// for chroma. Callers must consult `dst_format()` to know the layout.
+    pub fn plane(&self, idx: usize) -> Option<(&[u8], usize)> {
+        if idx > 2 {
+            return None;
+        }
+        unsafe {
+            let frame = &*self.frame;
+            let linesize = frame.linesize[idx] as usize;
+            if linesize == 0 {
+                return None;
+            }
+            let data = frame.data[idx];
+            if data.is_null() {
+                return None;
+            }
+            let height = frame.height as usize;
+            let plane_rows = match (self.dst_format, idx) {
+                (ScalerDstFormat::Yuvj420p, 1 | 2) => height / 2,
+                _ => height,
+            };
+            let slice = std::slice::from_raw_parts(data, linesize * plane_rows);
+            Some((slice, linesize))
+        }
     }
 
     pub(crate) fn as_ptr(&self) -> *const AVFrame {
@@ -53,10 +88,20 @@ pub struct VideoScaler {
     ctx: *mut SwsContext,
     dst_width: i32,
     dst_height: i32,
+    dst_format: ScalerDstFormat,
+    dst_pix_fmt: i32,
 }
 
 // SAFETY: SwsContext is per-instance with no shared global state.
 unsafe impl Send for VideoScaler {}
+
+fn scaler_dst_pix_fmt(fmt: ScalerDstFormat) -> i32 {
+    match fmt {
+        ScalerDstFormat::Yuvj420p => AVPixelFormat_AV_PIX_FMT_YUVJ420P,
+        ScalerDstFormat::Yuv422p8 => AVPixelFormat_AV_PIX_FMT_YUV422P,
+        ScalerDstFormat::Yuv422p10le => AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+    }
+}
 
 impl VideoScaler {
     /// Create a scaler from the given input format to YUVJ420P at the target
@@ -71,6 +116,30 @@ impl VideoScaler {
         dst_width: u32,
         dst_height: u32,
     ) -> Result<Self, VideoError> {
+        Self::new_with_dst_format(
+            src_width,
+            src_height,
+            src_format,
+            dst_width,
+            dst_height,
+            ScalerDstFormat::Yuvj420p,
+        )
+    }
+
+    /// Create a scaler that converts to an explicit destination pixel format.
+    ///
+    /// Used by RFC 4175 packetizers (ST 2110-20 / -23) which require planar
+    /// 4:2:2 at 8-bit or 10-bit LE on the wire. Existing callers should keep
+    /// using [`VideoScaler::new`] which defaults to `Yuvj420p`.
+    pub fn new_with_dst_format(
+        src_width: u32,
+        src_height: u32,
+        src_format: i32,
+        dst_width: u32,
+        dst_height: u32,
+        dst_format: ScalerDstFormat,
+    ) -> Result<Self, VideoError> {
+        let dst_pix_fmt = scaler_dst_pix_fmt(dst_format);
         unsafe {
             let ctx = sws_getContext(
                 src_width as i32,
@@ -78,7 +147,7 @@ impl VideoScaler {
                 src_format,
                 dst_width as i32,
                 dst_height as i32,
-                AVPixelFormat_AV_PIX_FMT_YUVJ420P, // Full-range YUV for MJPEG
+                dst_pix_fmt,
                 SWS_LANCZOS as i32,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -93,6 +162,8 @@ impl VideoScaler {
                 ctx,
                 dst_width: dst_width as i32,
                 dst_height: dst_height as i32,
+                dst_format,
+                dst_pix_fmt,
             })
         }
     }
@@ -108,7 +179,7 @@ impl VideoScaler {
 
             (*dst_frame).width = self.dst_width;
             (*dst_frame).height = self.dst_height;
-            (*dst_frame).format = AVPixelFormat_AV_PIX_FMT_YUVJ420P;
+            (*dst_frame).format = self.dst_pix_fmt;
 
             let ret = av_frame_get_buffer(dst_frame, 0);
             if ret < 0 {
@@ -128,8 +199,15 @@ impl VideoScaler {
                 (*dst_frame).linesize.as_ptr(),
             );
 
-            Ok(ScaledFrame { frame: dst_frame })
+            Ok(ScaledFrame {
+                frame: dst_frame,
+                dst_format: self.dst_format,
+            })
         }
+    }
+
+    pub fn dst_format(&self) -> ScalerDstFormat {
+        self.dst_format
     }
 }
 

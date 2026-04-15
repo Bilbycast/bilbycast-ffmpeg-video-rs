@@ -5,6 +5,16 @@ edition = "2021"
 license = "MPL-2.0"
 description = "Safe Rust wrapper around FFmpeg for video decode, scale, and JPEG encode"
 
+[features]
+default = []
+# Forward the optional video-encoder features from libffmpeg-video-sys.
+# Each of these enables compiled-in support for one encoder backend in
+# `VideoEncoder::open`. See libffmpeg-video-sys/Cargo.toml for the
+# licensing implications.
+video-encoder-x264 = ["libffmpeg-video-sys/video-encoder-x264"]
+video-encoder-x265 = ["libffmpeg-video-sys/video-encoder-x265"]
+video-encoder-nvenc = ["libffmpeg-video-sys/video-encoder-nvenc"]
+
 [dependencies]
 libffmpeg-video-sys = { path = "../libffmpeg-video-sys" }
 video-codec = { path = "../video-codec" }
