@@ -340,7 +340,27 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     configure_args.push(format!("--extra-cflags={extra_cflags}"));
     configure_args.push(format!("--extra-ldflags={extra_ldflags}"));
 
-    // Join all pkg-config search paths with the platform separator.
+    // Query pkg-config's default search path so system-installed libraries
+    // (x264, x265, ffnvcodec on Ubuntu/Debian) remain discoverable. Without
+    // this, setting PKG_CONFIG_LIBDIR would shadow the default paths — and
+    // since pkg-config suppresses -L for system lib dirs (e.g.
+    // /usr/lib/x86_64-linux-gnu), our probes via the Rust pkg-config crate
+    // return empty link_paths for system libs, so we'd have nothing to push.
+    let system_pkgconfig_path = Command::new("pkg-config")
+        .args(["--variable=pc_path", "pkg-config"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    for p in system_pkgconfig_path.split(':').filter(|s| !s.is_empty()) {
+        pkgconfig_paths.push(PathBuf::from(p));
+    }
+
+    // Join all pkg-config search paths with the platform separator. The
+    // vendored opus pkgconfig dir comes first so it wins over any
+    // system-installed libopus.
     let joined_pkgconfig = std::env::join_paths(pkgconfig_paths.iter())
         .expect("failed to join pkg-config paths");
 
