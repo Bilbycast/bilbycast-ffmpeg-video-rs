@@ -340,34 +340,25 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     configure_args.push(format!("--extra-cflags={extra_cflags}"));
     configure_args.push(format!("--extra-ldflags={extra_ldflags}"));
 
-    // Query pkg-config's default search path so system-installed libraries
-    // (x264, x265, ffnvcodec on Ubuntu/Debian) remain discoverable. Without
-    // this, setting PKG_CONFIG_LIBDIR would shadow the default paths — and
-    // since pkg-config suppresses -L for system lib dirs (e.g.
-    // /usr/lib/x86_64-linux-gnu), our probes via the Rust pkg-config crate
-    // return empty link_paths for system libs, so we'd have nothing to push.
-    let system_pkgconfig_path = Command::new("pkg-config")
-        .args(["--variable=pc_path", "pkg-config"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    for p in system_pkgconfig_path.split(':').filter(|s| !s.is_empty()) {
-        pkgconfig_paths.push(PathBuf::from(p));
-    }
-
-    // Join all pkg-config search paths with the platform separator. The
-    // vendored opus pkgconfig dir comes first so it wins over any
-    // system-installed libopus.
+    // Join our extra pkg-config dirs (vendored opus + any -L paths surfaced by
+    // x264/x265/ffnvcodec probes) with the platform separator. Setting
+    // PKG_CONFIG_PATH *prepends* to pkg-config's compile-time default search
+    // path, so system-installed libraries (x264/x265/ffnvcodec on Ubuntu) stay
+    // discoverable. Do NOT set PKG_CONFIG_LIBDIR — that would *replace* the
+    // defaults and hide system .pc files (pkg-config suppresses -L for system
+    // lib dirs, so the Rust pkg-config crate returns empty link_paths for
+    // them and we'd have nothing to repopulate those paths with).
     let joined_pkgconfig = std::env::join_paths(pkgconfig_paths.iter())
         .expect("failed to join pkg-config paths");
+    eprintln!(
+        "libffmpeg-video-sys: PKG_CONFIG_PATH={}",
+        joined_pkgconfig.to_string_lossy()
+    );
 
     let status = Command::new(&configure_path)
         .current_dir(&build_dir)
         .env("PKG_CONFIG_PATH", &joined_pkgconfig)
-        .env("PKG_CONFIG_LIBDIR", &joined_pkgconfig)
+        .env_remove("PKG_CONFIG_LIBDIR")
         .args(&configure_args)
         .status()
         .expect("failed to execute FFmpeg configure");
