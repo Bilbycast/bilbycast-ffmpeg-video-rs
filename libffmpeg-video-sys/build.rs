@@ -364,6 +364,17 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         .expect("failed to execute FFmpeg configure");
 
     if !status.success() {
+        // Surface FFmpeg's config.log so CI logs explain *why* configure died
+        // (e.g. a specific pkg-config probe for --static dep resolution).
+        let config_log = build_dir.join("ffbuild").join("config.log");
+        if let Ok(contents) = std::fs::read_to_string(&config_log) {
+            eprintln!(
+                "===== FFmpeg ffbuild/config.log (tail, last 200 lines) =====\n{}\n===== end =====",
+                contents.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+            );
+        } else {
+            eprintln!("(could not read {})", config_log.display());
+        }
         panic!("FFmpeg configure failed");
     }
 
