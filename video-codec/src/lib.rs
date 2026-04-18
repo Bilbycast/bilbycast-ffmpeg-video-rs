@@ -259,6 +259,10 @@ impl VideoPreset {
 }
 
 /// H.264/HEVC profile target. `Auto` lets the encoder pick.
+///
+/// High10 / High422 / High444 enable 10-bit and higher-chroma profiles on
+/// libx264 (compile-time profile gates in upstream libx264 — the vendored
+/// build enables all three). `Main10` is the HEVC 10-bit profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoProfile {
     #[default]
@@ -266,6 +270,10 @@ pub enum VideoProfile {
     Baseline,
     Main,
     High,
+    High10,
+    High422,
+    High444,
+    Main10,
 }
 
 impl VideoProfile {
@@ -275,6 +283,77 @@ impl VideoProfile {
             Self::Baseline => Some("baseline"),
             Self::Main => Some("main"),
             Self::High => Some("high"),
+            Self::High10 => Some("high10"),
+            Self::High422 => Some("high422"),
+            Self::High444 => Some("high444"),
+            Self::Main10 => Some("main10"),
+        }
+    }
+}
+
+/// Chroma subsampling target for the encoder input plane set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoChroma {
+    #[default]
+    Yuv420,
+    Yuv422,
+    Yuv444,
+}
+
+impl VideoChroma {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "yuv420p",
+            Self::Yuv422 => "yuv422p",
+            Self::Yuv444 => "yuv444p",
+        }
+    }
+
+    /// Chroma plane width given the luma width (rounded up for 4:2:x).
+    pub fn chroma_width(self, width: u32) -> u32 {
+        match self {
+            Self::Yuv420 | Self::Yuv422 => (width + 1) / 2,
+            Self::Yuv444 => width,
+        }
+    }
+
+    /// Chroma plane height given the luma height (rounded up for 4:2:0).
+    pub fn chroma_height(self, height: u32) -> u32 {
+        match self {
+            Self::Yuv420 => (height + 1) / 2,
+            Self::Yuv422 | Self::Yuv444 => height,
+        }
+    }
+}
+
+/// Rate-control mode for the video encoder.
+///
+/// - `Vbr` (default): the encoder tracks `bitrate_kbps` on average but may
+///   overshoot on complex scenes. Current legacy behaviour.
+/// - `Cbr`: constant bitrate — the encoder is constrained to hit
+///   `bitrate_kbps` as both min and max (sets HRD/VBV in x264/x265).
+/// - `Crf`: constant rate factor (quality-targeted) — `bitrate_kbps` is
+///   ignored; `crf` drives quantisation. x264/x265 map directly; NVENC
+///   maps `crf` onto its `cq` constant-quality knob.
+/// - `Abr`: average bitrate. Same effective behaviour as `Vbr` on
+///   libx264/x265 (they alias these); explicit for operators who want
+///   the ffmpeg nomenclature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoRateControl {
+    #[default]
+    Vbr,
+    Cbr,
+    Crf,
+    Abr,
+}
+
+impl VideoRateControl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vbr => "vbr",
+            Self::Cbr => "cbr",
+            Self::Crf => "crf",
+            Self::Abr => "abr",
         }
     }
 }
@@ -292,14 +371,50 @@ pub struct VideoEncoderConfig {
     pub fps_num: u32,
     /// Frame rate denominator (e.g. 1001 for 29.97 fps).
     pub fps_den: u32,
-    /// Target average bitrate in kbps.
+    /// Target average bitrate in kbps. Ignored in `Crf` rate-control mode.
     pub bitrate_kbps: u32,
+    /// Maximum bitrate cap in kbps for VBR (`rc_max_rate`). `0` means
+    /// unset — let the encoder choose. Used as CBR bound when
+    /// `rate_control == Cbr`.
+    pub max_bitrate_kbps: u32,
     /// Keyframe interval (GOP size) in frames.
     pub gop_size: u32,
     /// Speed / quality preset.
     pub preset: VideoPreset,
     /// Profile target.
     pub profile: VideoProfile,
+    /// Chroma subsampling for the encoder's input planes. Default 4:2:0.
+    pub chroma: VideoChroma,
+    /// Sample bit depth — 8 or 10. Values other than 8/10 are rejected.
+    pub bit_depth: u8,
+    /// Rate-control mode.
+    pub rate_control: VideoRateControl,
+    /// Quality target for `Crf` / NVENC constant-quality modes (0–51; lower
+    /// is better; typical broadcast range is 18–28). Ignored in other RC
+    /// modes.
+    pub crf: u8,
+    /// Number of consecutive B-frames. `0` disables B-frames (current
+    /// default — preserves legacy behaviour for callers that don't set it).
+    pub max_b_frames: u8,
+    /// Reference frames. `0` means let the encoder default.
+    pub refs: u8,
+    /// Encoder `tune` hint — e.g. `zerolatency` (default), `film`,
+    /// `animation`, `grain`, `fastdecode`. Empty string means "unset" and
+    /// the encoder picks its own default.
+    pub tune: String,
+    /// Codec level as a string (e.g. `4.0`, `5.1`). Empty string means
+    /// "let the encoder choose".
+    pub level: String,
+    /// Colour primaries tag (e.g. `bt709`, `bt2020`). Empty = unset.
+    pub color_primaries: String,
+    /// Transfer characteristics (e.g. `bt709`, `smpte2084`, `arib-std-b67`).
+    /// Empty = unset.
+    pub color_transfer: String,
+    /// Matrix coefficients (e.g. `bt709`, `bt2020nc`). Empty = unset.
+    pub color_matrix: String,
+    /// Colour range: `tv` (limited) or `pc` (full). Empty = unset (encoder
+    /// default, typically TV).
+    pub color_range: String,
     /// Emit SPS/PPS (or VPS/SPS/PPS) as a separate extradata blob
     /// instead of inside the bitstream. Required for RTP / RTMP / MP4.
     pub global_header: bool,
@@ -314,9 +429,22 @@ impl Default for VideoEncoderConfig {
             fps_num: 30,
             fps_den: 1,
             bitrate_kbps: 4000,
+            max_bitrate_kbps: 0,
             gop_size: 60,
             preset: VideoPreset::default(),
             profile: VideoProfile::default(),
+            chroma: VideoChroma::default(),
+            bit_depth: 8,
+            rate_control: VideoRateControl::default(),
+            crf: 23,
+            max_b_frames: 0,
+            refs: 0,
+            tune: "zerolatency".to_string(),
+            level: String::new(),
+            color_primaries: String::new(),
+            color_transfer: String::new(),
+            color_matrix: String::new(),
+            color_range: String::new(),
             global_header: true,
         }
     }

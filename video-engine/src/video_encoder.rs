@@ -27,7 +27,8 @@
 
 use libffmpeg_video_sys::*;
 use video_codec::{
-    EncodedVideoFrame, VideoEncoderCodec, VideoEncoderConfig, VideoEncoderError,
+    EncodedVideoFrame, VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoEncoderError,
+    VideoRateControl,
 };
 
 /// Safe video encoder wrapping FFmpeg's AVCodecContext.
@@ -40,8 +41,39 @@ pub struct VideoEncoder {
     height: u32,
     fps_num: u32,
     fps_den: u32,
+    chroma: VideoChroma,
+    bit_depth: u8,
     frame_count: i64,
     extradata: Option<Vec<u8>>,
+}
+
+/// Resolve `(chroma, bit_depth)` to an FFmpeg `AVPixelFormat`. Returns
+/// `Err(InvalidInput)` for unsupported combinations (e.g. 12-bit) so the
+/// caller surfaces a clear error instead of passing garbage to libav.
+fn resolve_pix_fmt(
+    chroma: VideoChroma,
+    bit_depth: u8,
+) -> Result<AVPixelFormat, VideoEncoderError> {
+    Ok(match (chroma, bit_depth) {
+        (VideoChroma::Yuv420, 8) => AVPixelFormat_AV_PIX_FMT_YUV420P,
+        (VideoChroma::Yuv422, 8) => AVPixelFormat_AV_PIX_FMT_YUV422P,
+        (VideoChroma::Yuv444, 8) => AVPixelFormat_AV_PIX_FMT_YUV444P,
+        (VideoChroma::Yuv420, 10) => AVPixelFormat_AV_PIX_FMT_YUV420P10LE,
+        (VideoChroma::Yuv422, 10) => AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+        (VideoChroma::Yuv444, 10) => AVPixelFormat_AV_PIX_FMT_YUV444P10LE,
+        (c, bd) => {
+            return Err(VideoEncoderError::InvalidInput(format!(
+                "unsupported chroma/bit_depth combination: {} at {}-bit (supported: 8 or 10)",
+                c.as_str(),
+                bd,
+            )));
+        }
+    })
+}
+
+/// Bytes per luma/chroma sample for a given bit depth (8 → 1, 10 → 2).
+fn bytes_per_sample(bit_depth: u8) -> usize {
+    if bit_depth > 8 { 2 } else { 1 }
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -85,6 +117,32 @@ impl VideoEncoder {
                 "fps_num and fps_den must be non-zero".into(),
             ));
         }
+        if config.bit_depth != 8 && config.bit_depth != 10 {
+            return Err(VideoEncoderError::InvalidInput(format!(
+                "bit_depth must be 8 or 10, got {}",
+                config.bit_depth
+            )));
+        }
+        // NVENC's pixel-format matrix is narrower than libx264/x265. Reject
+        // 10-bit 4:2:2 / 4:4:4 here rather than letting avcodec_open2
+        // return an opaque error.
+        if matches!(
+            config.codec,
+            VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc
+        ) {
+            if config.codec == VideoEncoderCodec::H264Nvenc && config.bit_depth != 8 {
+                return Err(VideoEncoderError::InvalidInput(
+                    "h264_nvenc requires bit_depth=8".into(),
+                ));
+            }
+            if config.chroma == VideoChroma::Yuv444 {
+                return Err(VideoEncoderError::InvalidInput(
+                    "NVENC backends do not support chroma=yuv444p".into(),
+                ));
+            }
+        }
+
+        let pix_fmt = resolve_pix_fmt(config.chroma, config.bit_depth)?;
 
         unsafe {
             // FFmpeg encoder name → *const c_char (NUL-terminated).
@@ -102,23 +160,60 @@ impl VideoEncoder {
 
             (*ctx).width = config.width as i32;
             (*ctx).height = config.height as i32;
-            (*ctx).pix_fmt = AVPixelFormat_AV_PIX_FMT_YUV420P;
+            (*ctx).pix_fmt = pix_fmt;
             // time_base = 1 / fps (single tick per frame in the encoder clock)
             (*ctx).time_base.num = config.fps_den as i32;
             (*ctx).time_base.den = config.fps_num as i32;
             (*ctx).framerate.num = config.fps_num as i32;
             (*ctx).framerate.den = config.fps_den as i32;
-            (*ctx).bit_rate = (config.bitrate_kbps as i64) * 1000;
             (*ctx).gop_size = config.gop_size as i32;
-            (*ctx).max_b_frames = 0; // simpler decoder interop, no B-frames
+            (*ctx).max_b_frames = config.max_b_frames as i32;
+
+            // Rate control. `Crf` leaves bit_rate unset (the encoder uses
+            // the CRF value instead). CBR clamps min=max=target. VBR/ABR
+            // set bit_rate and optionally rc_max_rate for a cap.
+            match config.rate_control {
+                VideoRateControl::Crf => {}
+                VideoRateControl::Cbr => {
+                    let br = (config.bitrate_kbps as i64) * 1000;
+                    (*ctx).bit_rate = br;
+                    (*ctx).rc_min_rate = br;
+                    (*ctx).rc_max_rate = br;
+                    (*ctx).rc_buffer_size = (br * 2) as i32; // 2 s VBV
+                }
+                VideoRateControl::Vbr | VideoRateControl::Abr => {
+                    (*ctx).bit_rate = (config.bitrate_kbps as i64) * 1000;
+                    if config.max_bitrate_kbps > 0 {
+                        (*ctx).rc_max_rate = (config.max_bitrate_kbps as i64) * 1000;
+                        (*ctx).rc_buffer_size = ((config.max_bitrate_kbps as i64) * 2000) as i32;
+                    }
+                }
+            }
+
+            // Colour metadata — only set when operator provided a value so
+            // we don't override the encoder's reasonable defaults.
+            if let Some(v) = parse_color_primaries(&config.color_primaries) {
+                (*ctx).color_primaries = v;
+            }
+            if let Some(v) = parse_color_transfer(&config.color_transfer) {
+                (*ctx).color_trc = v;
+            }
+            if let Some(v) = parse_color_matrix(&config.color_matrix) {
+                (*ctx).colorspace = v;
+            }
+            if let Some(v) = parse_color_range(&config.color_range) {
+                (*ctx).color_range = v;
+            }
 
             if config.global_header {
                 (*ctx).flags |= AV_CODEC_FLAG_GLOBAL_HEADER as i32;
             }
 
-            // Codec-private options (preset / profile). All four of the
-            // supported backends accept `preset` as a named string option;
-            // libx264 and libx265 additionally understand `profile`.
+            // Codec-private options (preset / profile / tune / level / refs /
+            // crf). All four supported backends accept `preset` as a named
+            // string option; libx264 and libx265 additionally understand
+            // `profile`, `level`, `refs`, and `crf`. NVENC consumes `preset`
+            // and `cq` (for constant-quality).
             let mut opts: *mut AVDictionary = std::ptr::null_mut();
             let preset_key = std::ffi::CString::new("preset").unwrap();
             let preset_val = std::ffi::CString::new(config.preset.as_str()).unwrap();
@@ -130,12 +225,62 @@ impl VideoEncoder {
                 av_dict_set(&mut opts, profile_key.as_ptr(), profile_val.as_ptr(), 0);
             }
 
-            // Tuning: low-latency for our broadcast use case. Libx264
-            // takes `zerolatency`, libx265 takes `tune=zerolatency`, NVENC
-            // accepts both. Harmless to set on any of them.
-            let tune_key = std::ffi::CString::new("tune").unwrap();
-            let tune_val = std::ffi::CString::new("zerolatency").unwrap();
-            av_dict_set(&mut opts, tune_key.as_ptr(), tune_val.as_ptr(), 0);
+            // Tuning: configurable. Empty string = don't pass to encoder
+            // (let it choose). Default remains "zerolatency" via the
+            // VideoEncoderConfig default.
+            if !config.tune.is_empty() {
+                let tune_key = std::ffi::CString::new("tune").unwrap();
+                let tune_val = std::ffi::CString::new(config.tune.as_str())
+                    .map_err(|_| VideoEncoderError::InvalidInput("tune contains NUL".into()))?;
+                av_dict_set(&mut opts, tune_key.as_ptr(), tune_val.as_ptr(), 0);
+            }
+
+            if !config.level.is_empty() {
+                let level_key = std::ffi::CString::new("level").unwrap();
+                let level_val = std::ffi::CString::new(config.level.as_str())
+                    .map_err(|_| VideoEncoderError::InvalidInput("level contains NUL".into()))?;
+                av_dict_set(&mut opts, level_key.as_ptr(), level_val.as_ptr(), 0);
+            }
+
+            if config.refs > 0 {
+                let refs_key = std::ffi::CString::new("refs").unwrap();
+                let refs_val = std::ffi::CString::new(config.refs.to_string()).unwrap();
+                av_dict_set(&mut opts, refs_key.as_ptr(), refs_val.as_ptr(), 0);
+            }
+
+            if matches!(config.rate_control, VideoRateControl::Crf) {
+                // libx264/x265 use `crf`; NVENC uses `cq`. Setting both is
+                // harmless on the encoder that doesn't understand the other.
+                let crf_val_str = std::ffi::CString::new(config.crf.to_string()).unwrap();
+                let crf_key = std::ffi::CString::new("crf").unwrap();
+                av_dict_set(&mut opts, crf_key.as_ptr(), crf_val_str.as_ptr(), 0);
+                let cq_key = std::ffi::CString::new("cq").unwrap();
+                av_dict_set(&mut opts, cq_key.as_ptr(), crf_val_str.as_ptr(), 0);
+                // NVENC needs the rc mode flipped explicitly.
+                if matches!(
+                    config.codec,
+                    VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc
+                ) {
+                    let rc_key = std::ffi::CString::new("rc").unwrap();
+                    let rc_val = std::ffi::CString::new("vbr").unwrap();
+                    av_dict_set(&mut opts, rc_key.as_ptr(), rc_val.as_ptr(), 0);
+                }
+            } else if matches!(config.rate_control, VideoRateControl::Cbr) {
+                // Surface CBR to x264's HRD so the bitstream carries
+                // nal-hrd=cbr; NVENC has a native `rc=cbr` switch.
+                if matches!(config.codec, VideoEncoderCodec::X264) {
+                    let xkey = std::ffi::CString::new("x264-params").unwrap();
+                    let xval = std::ffi::CString::new("nal-hrd=cbr").unwrap();
+                    av_dict_set(&mut opts, xkey.as_ptr(), xval.as_ptr(), 0);
+                } else if matches!(
+                    config.codec,
+                    VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc
+                ) {
+                    let rc_key = std::ffi::CString::new("rc").unwrap();
+                    let rc_val = std::ffi::CString::new("cbr").unwrap();
+                    av_dict_set(&mut opts, rc_key.as_ptr(), rc_val.as_ptr(), 0);
+                }
+            }
 
             let ret = avcodec_open2(ctx, codec_ptr, &mut opts);
             av_dict_free(&mut opts);
@@ -194,10 +339,22 @@ impl VideoEncoder {
                 height: config.height,
                 fps_num: config.fps_num,
                 fps_den: config.fps_den,
+                chroma: config.chroma,
+                bit_depth: config.bit_depth,
                 frame_count: 0,
                 extradata,
             })
         }
+    }
+
+    /// Chroma subsampling the encoder was opened with.
+    pub fn chroma(&self) -> VideoChroma {
+        self.chroma
+    }
+
+    /// Sample bit depth the encoder was opened with (8 or 10).
+    pub fn bit_depth(&self) -> u8 {
+        self.bit_depth
     }
 
     /// The backend this encoder was opened for.
@@ -242,26 +399,31 @@ impl VideoEncoder {
         pts: Option<i64>,
     ) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
         let h = self.height as usize;
-        let hh = (self.height as usize + 1) / 2;
+        let hh = self.chroma.chroma_height(self.height) as usize;
         let w = self.width as usize;
-        let ww = (self.width as usize + 1) / 2;
+        let ww = self.chroma.chroma_width(self.width) as usize;
+        let bps = bytes_per_sample(self.bit_depth);
+        // Minimum useful stride (in bytes): one sample per pixel in the
+        // row, widened for 10-bit (2 bytes/sample).
+        let min_y_stride = w * bps;
+        let min_chroma_stride = ww * bps;
 
-        if y.len() < y_stride * h || y_stride < w {
+        if y.len() < y_stride * h || y_stride < min_y_stride {
             return Err(VideoEncoderError::InvalidInput(format!(
-                "Y plane too small: need {}x{} (stride>={}), got {} bytes at stride {}",
-                w, h, w, y.len(), y_stride
+                "Y plane too small: need {}x{} (stride>={} bytes), got {} bytes at stride {}",
+                w, h, min_y_stride, y.len(), y_stride
             )));
         }
-        if u.len() < u_stride * hh || u_stride < ww {
+        if u.len() < u_stride * hh || u_stride < min_chroma_stride {
             return Err(VideoEncoderError::InvalidInput(format!(
-                "U plane too small: need {}x{} (stride>={}), got {} bytes at stride {}",
-                ww, hh, ww, u.len(), u_stride
+                "U plane too small: need {}x{} (stride>={} bytes), got {} bytes at stride {}",
+                ww, hh, min_chroma_stride, u.len(), u_stride
             )));
         }
-        if v.len() < v_stride * hh || v_stride < ww {
+        if v.len() < v_stride * hh || v_stride < min_chroma_stride {
             return Err(VideoEncoderError::InvalidInput(format!(
-                "V plane too small: need {}x{} (stride>={}), got {} bytes at stride {}",
-                ww, hh, ww, v.len(), v_stride
+                "V plane too small: need {}x{} (stride>={} bytes), got {} bytes at stride {}",
+                ww, hh, min_chroma_stride, v.len(), v_stride
             )));
         }
 
@@ -372,6 +534,53 @@ unsafe fn copy_plane(
         let dst_row = dst.add(r * dst_stride);
         let src_row = src.as_ptr().add(r * src_stride);
         std::ptr::copy_nonoverlapping(src_row, dst_row, width);
+    }
+}
+
+fn parse_color_primaries(s: &str) -> Option<AVColorPrimaries> {
+    match s {
+        "" => None,
+        "bt709" => Some(AVColorPrimaries_AVCOL_PRI_BT709),
+        "bt2020" => Some(AVColorPrimaries_AVCOL_PRI_BT2020),
+        "smpte170m" => Some(AVColorPrimaries_AVCOL_PRI_SMPTE170M),
+        "smpte240m" => Some(AVColorPrimaries_AVCOL_PRI_SMPTE240M),
+        "bt470m" => Some(AVColorPrimaries_AVCOL_PRI_BT470M),
+        "bt470bg" => Some(AVColorPrimaries_AVCOL_PRI_BT470BG),
+        _ => None,
+    }
+}
+
+fn parse_color_transfer(s: &str) -> Option<AVColorTransferCharacteristic> {
+    match s {
+        "" => None,
+        "bt709" => Some(AVColorTransferCharacteristic_AVCOL_TRC_BT709),
+        "smpte170m" => Some(AVColorTransferCharacteristic_AVCOL_TRC_SMPTE170M),
+        "smpte2084" | "pq" => Some(AVColorTransferCharacteristic_AVCOL_TRC_SMPTE2084),
+        "arib-std-b67" | "hlg" => Some(AVColorTransferCharacteristic_AVCOL_TRC_ARIB_STD_B67),
+        "bt2020-10" => Some(AVColorTransferCharacteristic_AVCOL_TRC_BT2020_10),
+        "bt2020-12" => Some(AVColorTransferCharacteristic_AVCOL_TRC_BT2020_12),
+        _ => None,
+    }
+}
+
+fn parse_color_matrix(s: &str) -> Option<AVColorSpace> {
+    match s {
+        "" => None,
+        "bt709" => Some(AVColorSpace_AVCOL_SPC_BT709),
+        "bt2020nc" => Some(AVColorSpace_AVCOL_SPC_BT2020_NCL),
+        "bt2020c" => Some(AVColorSpace_AVCOL_SPC_BT2020_CL),
+        "smpte170m" => Some(AVColorSpace_AVCOL_SPC_SMPTE170M),
+        "smpte240m" => Some(AVColorSpace_AVCOL_SPC_SMPTE240M),
+        _ => None,
+    }
+}
+
+fn parse_color_range(s: &str) -> Option<AVColorRange> {
+    match s {
+        "" => None,
+        "tv" | "limited" | "mpeg" => Some(AVColorRange_AVCOL_RANGE_MPEG),
+        "pc" | "full" | "jpeg" => Some(AVColorRange_AVCOL_RANGE_JPEG),
+        _ => None,
     }
 }
 
