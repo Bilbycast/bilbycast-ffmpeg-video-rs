@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Reza Rahimi / Softside Tech Pty Ltd. All rights reserved.
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
 //! Safe video scaler wrapping FFmpeg's libswscale.
