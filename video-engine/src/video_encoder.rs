@@ -45,6 +45,10 @@ pub struct VideoEncoder {
     bit_depth: u8,
     frame_count: i64,
     extradata: Option<Vec<u8>>,
+    /// When set, the next [`encode_frame`](Self::encode_frame) call marks
+    /// its `AVFrame.pict_type = AV_PICTURE_TYPE_I` so the encoder emits an
+    /// IDR for that frame. Cleared automatically once consumed.
+    force_idr_next: bool,
 }
 
 /// Resolve `(chroma, bit_depth)` to an FFmpeg `AVPixelFormat`. Returns
@@ -343,6 +347,7 @@ impl VideoEncoder {
                 bit_depth: config.bit_depth,
                 frame_count: 0,
                 extradata,
+                force_idr_next: false,
             })
         }
     }
@@ -376,6 +381,23 @@ impl VideoEncoder {
     /// HEVC). `None` if the encoder emits headers inline.
     pub fn extradata(&self) -> Option<&[u8]> {
         self.extradata.as_deref()
+    }
+
+    /// Arm a one-shot IDR request on the next encoded frame.
+    ///
+    /// The next call to [`encode_frame`](Self::encode_frame) marks its
+    /// `AVFrame.pict_type = AV_PICTURE_TYPE_I` before sending to the
+    /// encoder, which causes libx264 / libx265 / NVENC to emit an IDR for
+    /// that frame regardless of the configured GOP position. The flag is
+    /// consumed by the next encode call; subsequent frames revert to the
+    /// encoder's normal rate-control-driven frame-type decisions.
+    ///
+    /// Used by the seamless input-switch path: when a flow switches to a
+    /// different re-encoded input, the new input's encoder needs to emit a
+    /// keyframe so downstream decoders can resync immediately instead of
+    /// waiting up to a full GOP for the next natural IDR.
+    pub fn force_next_keyframe(&mut self) {
+        self.force_idr_next = true;
     }
 
     /// Encode one decoded YUV-4:2:0 frame.
@@ -437,6 +459,19 @@ impl VideoEncoder {
 
             (*self.frame).pts = pts.unwrap_or(self.frame_count);
             self.frame_count = (*self.frame).pts + 1;
+
+            // One-shot IDR request: libx264 / libx265 / NVENC all honour
+            // `pict_type = I` by emitting an IDR for that frame. Required
+            // for seamless input switching — the downstream decoder needs
+            // a keyframe on the first frame after a switch, regardless of
+            // where we are in the current GOP. Always reset to NONE on
+            // normal frames so the encoder's rate control stays in charge.
+            if self.force_idr_next {
+                (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
+                self.force_idr_next = false;
+            } else {
+                (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+            }
 
             self.send_and_receive()
         }

@@ -103,6 +103,26 @@ fn scaler_dst_pix_fmt(fmt: ScalerDstFormat) -> i32 {
     }
 }
 
+/// Resolve a planar YUV `(chroma, bit_depth)` pair into the FFmpeg
+/// `AVPixelFormat` integer used by the scaler / encoder. Exposed so
+/// edge-side call sites that operate on raw planes (ST 2110-20 / -23
+/// RFC 4175 depacketisation) can describe their planes to
+/// [`VideoScaler::scale_raw_planes`] without depending on
+/// `libffmpeg-video-sys` directly.
+///
+/// Returns `None` for combinations that the scaler / encoder don't
+/// support today (4:4:4).
+pub fn av_pix_fmt_for_yuv(chroma: video_codec::VideoChroma, bit_depth: u8) -> Option<i32> {
+    use video_codec::VideoChroma;
+    match (chroma, bit_depth) {
+        (VideoChroma::Yuv420, 8) => Some(AVPixelFormat_AV_PIX_FMT_YUV420P),
+        (VideoChroma::Yuv422, 8) => Some(AVPixelFormat_AV_PIX_FMT_YUV422P),
+        (VideoChroma::Yuv420, 10) => Some(AVPixelFormat_AV_PIX_FMT_YUV420P10LE),
+        (VideoChroma::Yuv422, 10) => Some(AVPixelFormat_AV_PIX_FMT_YUV422P10LE),
+        _ => None,
+    }
+}
+
 impl VideoScaler {
     /// Create a scaler from the given input format to YUVJ420P at the target
     /// dimensions. Uses Lanczos scaling for high-quality thumbnails.
@@ -198,6 +218,88 @@ impl VideoScaler {
                 (*dst_frame).data.as_ptr(),
                 (*dst_frame).linesize.as_ptr(),
             );
+
+            Ok(ScaledFrame {
+                frame: dst_frame,
+                dst_format: self.dst_format,
+            })
+        }
+    }
+
+    /// Scale raw planar YUV planes (Y, U, V slices + byte strides) that
+    /// did not come from a [`crate::VideoDecoder`].
+    ///
+    /// Used by callers that depacketise raw video directly (RFC 4175 /
+    /// SMPTE ST 2110-20 / -23) and need to feed planar frames into a
+    /// [`crate::VideoEncoder`] at a different output resolution.
+    ///
+    /// `src_w`, `src_h`, and `src_format` must match the planes provided:
+    /// the scaler validates that these agree with the scaler's own
+    /// configured source dimensions / pixel format and returns
+    /// [`VideoError::InvalidInput`] on mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_raw_planes(
+        &self,
+        src_w: u32,
+        src_h: u32,
+        src_format: i32,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        u_stride: usize,
+        v: &[u8],
+        v_stride: usize,
+    ) -> Result<ScaledFrame, VideoError> {
+        unsafe {
+            // Build a temporary src AVFrame that wraps the caller's
+            // slices — no copy, just pointer wiring. We don't hand this
+            // frame out, so plane lifetimes are bounded by this call.
+            let src_frame = av_frame_alloc();
+            if src_frame.is_null() {
+                return Err(VideoError::AllocFrame);
+            }
+            (*src_frame).width = src_w as i32;
+            (*src_frame).height = src_h as i32;
+            (*src_frame).format = src_format;
+            (*src_frame).data[0] = y.as_ptr() as *mut u8;
+            (*src_frame).data[1] = u.as_ptr() as *mut u8;
+            (*src_frame).data[2] = v.as_ptr() as *mut u8;
+            (*src_frame).linesize[0] = y_stride as i32;
+            (*src_frame).linesize[1] = u_stride as i32;
+            (*src_frame).linesize[2] = v_stride as i32;
+
+            let dst_frame = av_frame_alloc();
+            if dst_frame.is_null() {
+                av_frame_free(&mut { src_frame });
+                return Err(VideoError::AllocFrame);
+            }
+            (*dst_frame).width = self.dst_width;
+            (*dst_frame).height = self.dst_height;
+            (*dst_frame).format = self.dst_pix_fmt;
+
+            let ret = av_frame_get_buffer(dst_frame, 0);
+            if ret < 0 {
+                av_frame_free(&mut { dst_frame });
+                av_frame_free(&mut { src_frame });
+                return Err(VideoError::AllocFrameBuffer(ret));
+            }
+
+            sws_scale(
+                self.ctx,
+                (*src_frame).data.as_ptr() as *const *const u8,
+                (*src_frame).linesize.as_ptr(),
+                0,
+                (*src_frame).height,
+                (*dst_frame).data.as_ptr(),
+                (*dst_frame).linesize.as_ptr(),
+            );
+
+            // Zero the wrapping pointers before free so libavutil
+            // doesn't try to free memory it doesn't own.
+            (*src_frame).data[0] = std::ptr::null_mut();
+            (*src_frame).data[1] = std::ptr::null_mut();
+            (*src_frame).data[2] = std::ptr::null_mut();
+            av_frame_free(&mut { src_frame });
 
             Ok(ScaledFrame {
                 frame: dst_frame,

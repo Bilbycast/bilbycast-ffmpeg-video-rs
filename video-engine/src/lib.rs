@@ -24,9 +24,9 @@ pub mod thumbnail;
 pub mod video_encoder;
 
 pub use audio_encoder::AudioEncoder;
-pub use decoder::VideoDecoder;
+pub use decoder::{DecodedFrame, VideoDecoder};
 pub use encoder::JpegEncoder;
-pub use scaler::VideoScaler;
+pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
 pub use thumbnail::decode_thumbnail;
 pub use video_encoder::VideoEncoder;
 
