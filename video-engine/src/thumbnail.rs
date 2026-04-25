@@ -62,18 +62,48 @@ pub fn decode_thumbnail(
     // 1. Open decoder
     let mut decoder = VideoDecoder::open(codec)?;
 
-    // 2. Send data and try to decode a frame
+    // 2. Send all NAL data, then drain every decoded frame — we want the
+    //    LATEST picture in the buffer, not just the first one. On a long-
+    //    GOP source (e.g. an MP4 with a 10 s GOP) the buffer typically
+    //    contains [IDR, P, P, …, P]; returning the IDR means the
+    //    thumbnail freezes for the duration of one GOP and the
+    //    upstream freeze detector falsely flags the stream. Walking
+    //    forward to the last P-frame is what an operator actually
+    //    wants to see and matches what every consumer-grade media
+    //    player shows.
     decoder.send_packet(nalu_data)?;
 
-    let frame = match decoder.receive_frame() {
-        Ok(frame) => frame,
-        Err(VideoError::NeedMoreInput) => {
-            // Flush decoder to get any buffered frames
-            decoder.send_flush()?;
-            decoder.receive_frame()?
+    let mut latest: Option<crate::decoder::DecodedFrame> = None;
+    loop {
+        match decoder.receive_frame() {
+            Ok(frame) => latest = Some(frame),
+            Err(VideoError::NeedMoreInput) => break,
+            Err(VideoError::Eof) => break,
+            Err(e) => {
+                // Mid-stream decode error: keep what we already have if
+                // anything, otherwise propagate.
+                if latest.is_none() {
+                    return Err(e);
+                } else {
+                    break;
+                }
+            }
         }
-        Err(e) => return Err(e),
-    };
+    }
+
+    // Flush to release any trailing frame still buffered inside
+    // libavcodec (the trailing P-frame after the last full slice).
+    if decoder.send_flush().is_ok() {
+        loop {
+            match decoder.receive_frame() {
+                Ok(frame) => latest = Some(frame),
+                Err(VideoError::Eof) | Err(VideoError::NeedMoreInput) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    let frame = latest.ok_or(VideoError::NeedMoreInput)?;
 
     // 3. Compute luminance before scaling (source resolution Y plane)
     let luminance = frame.average_luminance();
