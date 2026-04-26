@@ -32,6 +32,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 | **H.264 video encode (libx264)** | Opt-in via `video-encoder-x264` feature (GPL v2+) |
 | **HEVC video encode (libx265)** | Opt-in via `video-encoder-x265` feature (GPL v2+) |
 | **NVENC H.264 / HEVC encode** | Opt-in via `video-encoder-nvenc` feature (LGPL-clean, NVIDIA GPU required at runtime) |
+| **QSV H.264 / HEVC encode (Intel oneVPL)** | Opt-in via `video-encoder-qsv` feature (LGPL-clean, x86_64 only, Intel iGPU + media driver required at runtime) |
 
 ## Build & Test
 
@@ -61,6 +62,12 @@ cargo build -p video-engine --features video-encoder-x265
 # NVIDIA NVENC (LGPL-clean, needs NVIDIA driver at runtime)
 sudo apt install nv-codec-headers
 cargo build -p video-engine --features video-encoder-nvenc
+
+# Intel QuickSync via oneVPL (LGPL-clean, x86_64 only, needs Intel iGPU
+# + media driver at runtime). H.264 supported on Broadwell (5th gen) and
+# newer; HEVC on Kaby Lake (7th gen) and newer.
+sudo apt install libvpl-dev
+cargo build -p video-engine --features video-encoder-qsv
 ```
 
 ### Prerequisites
@@ -74,6 +81,7 @@ cargo build -p video-engine --features video-encoder-nvenc
   - `libx264-dev` when building with `video-encoder-x264` (GPL v2+)
   - `libx265-dev` when building with `video-encoder-x265` (GPL v2+)
   - `nv-codec-headers` when building with `video-encoder-nvenc` (royalty-free, NVIDIA driver required at runtime)
+  - `libvpl-dev` when building with `video-encoder-qsv` (royalty-free, x86_64 only, Intel media driver + libvpl runtime required at runtime)
 
 ## Architecture
 

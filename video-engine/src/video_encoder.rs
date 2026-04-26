@@ -6,8 +6,9 @@
 //! Supports H.264 (libx264) and HEVC (libx265) via opt-in Cargo features
 //! (`video-encoder-x264`, `video-encoder-x265`) — both of which pull in
 //! GPL-licensed libraries and flip the whole FFmpeg build to GPL v2+.
-//! NVENC hardware encoders (`video-encoder-nvenc`) are also available as
-//! a future opt-in.
+//! NVENC hardware encoders (`video-encoder-nvenc`) and Intel QuickSync
+//! hardware encoders (`video-encoder-qsv`, via Intel oneVPL) are also
+//! available as opt-ins — both LGPL-clean at the FFmpeg layer.
 //!
 //! Input: planar YUV 4:2:0 (8-bit) frames with explicit strides (i.e. the
 //! byte layout produced by `VideoDecoder` after a pass through
@@ -109,6 +110,11 @@ impl VideoEncoder {
                     return Err(VideoEncoderError::EncoderDisabled(config.codec));
                 }
             }
+            VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv => {
+                if !cfg!(feature = "video-encoder-qsv") {
+                    return Err(VideoEncoderError::EncoderDisabled(config.codec));
+                }
+            }
         }
 
         if config.width == 0 || config.height == 0 {
@@ -142,6 +148,24 @@ impl VideoEncoder {
             if config.chroma == VideoChroma::Yuv444 {
                 return Err(VideoEncoderError::InvalidInput(
                     "NVENC backends do not support chroma=yuv444p".into(),
+                ));
+            }
+        }
+        // QSV's pixel-format matrix is similar to NVENC: h264_qsv is
+        // 8-bit only (use hevc_qsv for 10-bit on supported hardware), and
+        // neither QSV variant supports 4:4:4 chroma in oneVPL today.
+        if matches!(
+            config.codec,
+            VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
+        ) {
+            if config.codec == VideoEncoderCodec::H264Qsv && config.bit_depth != 8 {
+                return Err(VideoEncoderError::InvalidInput(
+                    "h264_qsv requires bit_depth=8 (use hevc_qsv for 10-bit)".into(),
+                ));
+            }
+            if config.chroma == VideoChroma::Yuv444 {
+                return Err(VideoEncoderError::InvalidInput(
+                    "QSV backends do not support chroma=yuv444p".into(),
                 ));
             }
         }

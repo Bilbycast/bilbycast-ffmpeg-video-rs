@@ -188,6 +188,9 @@ pub enum AudioError {
 /// - `X265` requires the `video-encoder-x265` feature (GPL v2+).
 /// - `H264Nvenc` / `HevcNvenc` require the `video-encoder-nvenc` feature
 ///   and an NVIDIA GPU with a suitable driver.
+/// - `H264Qsv` / `HevcQsv` require the `video-encoder-qsv` feature, an
+///   Intel iGPU (or Arc dGPU), and the Intel media driver + libvpl
+///   runtime on the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoEncoderCodec {
     /// libx264 → H.264 (Advanced Video Coding).
@@ -198,14 +201,22 @@ pub enum VideoEncoderCodec {
     H264Nvenc,
     /// NVENC HEVC hardware encoder.
     HevcNvenc,
+    /// Intel QuickSync (oneVPL) H.264 hardware encoder.
+    H264Qsv,
+    /// Intel QuickSync (oneVPL) HEVC hardware encoder.
+    HevcQsv,
 }
 
 impl VideoEncoderCodec {
     /// The codec family produced on the wire, irrespective of backend.
     pub fn family(self) -> VideoCodec {
         match self {
-            VideoEncoderCodec::X264 | VideoEncoderCodec::H264Nvenc => VideoCodec::H264,
-            VideoEncoderCodec::X265 | VideoEncoderCodec::HevcNvenc => VideoCodec::Hevc,
+            VideoEncoderCodec::X264
+            | VideoEncoderCodec::H264Nvenc
+            | VideoEncoderCodec::H264Qsv => VideoCodec::H264,
+            VideoEncoderCodec::X265
+            | VideoEncoderCodec::HevcNvenc
+            | VideoEncoderCodec::HevcQsv => VideoCodec::Hevc,
         }
     }
 
@@ -216,6 +227,8 @@ impl VideoEncoderCodec {
             VideoEncoderCodec::X265 => "libx265",
             VideoEncoderCodec::H264Nvenc => "h264_nvenc",
             VideoEncoderCodec::HevcNvenc => "hevc_nvenc",
+            VideoEncoderCodec::H264Qsv => "h264_qsv",
+            VideoEncoderCodec::HevcQsv => "hevc_qsv",
         }
     }
 }

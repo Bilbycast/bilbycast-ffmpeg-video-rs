@@ -335,6 +335,30 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-encoder=hevc_nvenc".into());
     }
 
+    if cfg!(feature = "video-encoder-qsv") {
+        // Intel QuickSync via oneVPL (libvpl). Modern path — replaces the
+        // legacy MediaSDK / `--enable-libmfx`. Headers + dispatcher are
+        // MIT/Apache; no `--enable-nonfree` needed. The pkg-config module
+        // shipped by `libvpl-dev` (Debian/Ubuntu 24.04+) is named "vpl".
+        let vpl = pkg_config::Config::new().probe("vpl").expect(
+            "pkg-config: vpl not found. \
+             Install libvpl-dev (Debian/Ubuntu 24.04+) to build with the \
+             video-encoder-qsv feature.",
+        );
+        for inc in &vpl.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        for lp in &vpl.link_paths {
+            extra_ldflags.push(' ');
+            extra_ldflags.push_str(&format!("-L{}", lp.display()));
+            pkgconfig_paths.push(lp.join("pkgconfig"));
+        }
+        configure_args.push("--enable-libvpl".into());
+        configure_args.push("--enable-encoder=h264_qsv".into());
+        configure_args.push("--enable-encoder=hevc_qsv".into());
+    }
+
     // Extra cflags / ldflags must be passed last (accumulated across
     // every optional dep above).
     configure_args.push(format!("--extra-cflags={extra_cflags}"));
