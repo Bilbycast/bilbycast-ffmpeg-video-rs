@@ -67,6 +67,7 @@ fn main() {
         .clang_arg(format!("-I{}", include_path.display()))
         // ── avcodec ──
         .allowlist_function("avcodec_find_decoder")
+        .allowlist_function("avcodec_find_decoder_by_name")
         .allowlist_function("avcodec_alloc_context3")
         .allowlist_function("avcodec_free_context")
         .allowlist_function("avcodec_open2")

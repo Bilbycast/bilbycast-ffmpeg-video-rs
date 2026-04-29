@@ -19,6 +19,7 @@
 pub mod audio_encoder;
 pub mod decoder;
 pub mod encoder;
+pub mod probe;
 pub mod scaler;
 pub mod thumbnail;
 pub mod video_encoder;
@@ -26,6 +27,7 @@ pub mod video_encoder;
 pub use audio_encoder::AudioEncoder;
 pub use decoder::{DecodedFrame, VideoDecoder};
 pub use encoder::JpegEncoder;
+pub use probe::{is_decoder_available, is_encoder_available};
 pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
 pub use thumbnail::decode_thumbnail;
 pub use video_encoder::VideoEncoder;
