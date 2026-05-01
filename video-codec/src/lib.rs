@@ -126,6 +126,48 @@ impl std::fmt::Display for AudioCodecType {
     }
 }
 
+/// Supported audio codecs for in-process **decoding** via libavcodec.
+///
+/// AAC variants stay on `bilbycast-fdk-aac-rs` (better quality + already
+/// in tree); this enum covers the non-AAC broadcast codecs the
+/// bilbycast-edge `display` output needs to render to ALSA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioDecoderCodec {
+    /// MPEG-1 Layer II — UK / EU SD broadcast.
+    Mp2,
+    /// AC-3 (Dolby Digital) — US ATSC broadcast.
+    Ac3,
+    /// Enhanced AC-3 (Dolby Digital Plus) — UHD, ATSC 3.0.
+    Eac3,
+    /// Opus — WebRTC and modern web ingest.
+    Opus,
+}
+
+impl AudioDecoderCodec {
+    /// MPEG-TS stream type identifier (where applicable). Opus over TS
+    /// rides on a private stream type with a registration descriptor;
+    /// the demuxer takes care of that mapping.
+    pub fn ts_stream_type(self) -> u8 {
+        match self {
+            Self::Mp2 => 0x04,
+            Self::Ac3 => 0x81,
+            Self::Eac3 => 0x87,
+            Self::Opus => 0x06, // private_data — paired with Opus reg descriptor
+        }
+    }
+}
+
+impl std::fmt::Display for AudioDecoderCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mp2 => write!(f, "MP2"),
+            Self::Ac3 => write!(f, "AC-3"),
+            Self::Eac3 => write!(f, "E-AC-3"),
+            Self::Opus => write!(f, "Opus"),
+        }
+    }
+}
+
 /// Configuration for audio encoding.
 #[derive(Debug, Clone)]
 pub struct AudioEncoderConfig {
@@ -177,6 +219,34 @@ pub enum AudioError {
     /// Invalid input parameters.
     #[error("invalid audio input: {0}")]
     InvalidInput(String),
+
+    /// Audio decoder not found in FFmpeg's registry.
+    #[error("audio decoder not found: {0}")]
+    DecoderNotFound(AudioDecoderCodec),
+
+    /// Failed to send packet to decoder.
+    #[error("failed to send packet to audio decoder: FFmpeg error {0}")]
+    SendPacket(i32),
+
+    /// Failed to receive decoded frame.
+    #[error("failed to receive decoded audio frame: FFmpeg error {0}")]
+    ReceiveFrame(i32),
+
+    /// No frame available yet (EAGAIN — need more input).
+    #[error("no audio frame available yet (need more input data)")]
+    NeedMoreInput,
+
+    /// End of stream reached.
+    #[error("audio decoder end of stream")]
+    Eof,
+
+    /// Failed to allocate / configure the resampler context.
+    #[error("failed to allocate resampler: FFmpeg error {0}")]
+    AllocResampler(i32),
+
+    /// Failed to convert samples through the resampler.
+    #[error("failed to convert audio samples: FFmpeg error {0}")]
+    ResampleConvert(i32),
 }
 
 // ── Video encoder types ─────────────────────────────────────────────────

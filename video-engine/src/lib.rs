@@ -16,6 +16,7 @@
 //! All FFI calls are encapsulated behind safe Rust APIs. The types are `Send`
 //! but not `Sync` (same pattern as `AacDecoder` in bilbycast-fdk-aac-rs).
 
+pub mod audio_decoder;
 pub mod audio_encoder;
 pub mod decoder;
 pub mod encoder;
@@ -24,6 +25,7 @@ pub mod scaler;
 pub mod thumbnail;
 pub mod video_encoder;
 
+pub use audio_decoder::{AudioDecoder, DecodedAudioFrame};
 pub use audio_encoder::AudioEncoder;
 pub use decoder::{DecodedFrame, VideoDecoder};
 pub use encoder::JpegEncoder;

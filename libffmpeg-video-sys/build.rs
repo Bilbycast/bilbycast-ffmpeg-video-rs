@@ -104,6 +104,17 @@ fn main() {
         .allowlist_function("sws_getContext")
         .allowlist_function("sws_scale")
         .allowlist_function("sws_freeContext")
+        // ── swresample ──
+        // Used by the audio decoder to normalise non-fltp source formats
+        // (MP2 → s16p, AC-3 → fltp, Opus → fltp, etc.) into planar f32
+        // for the bilbycast-edge audio pipeline.
+        .allowlist_function("swr_alloc_set_opts2")
+        .allowlist_function("swr_init")
+        .allowlist_function("swr_free")
+        .allowlist_function("swr_convert")
+        .allowlist_function("swr_get_delay")
+        .allowlist_function("swr_get_out_samples")
+        .allowlist_type("SwrContext")
         // ── Types ──
         .allowlist_type("AVCodecContext")
         .allowlist_type("AVCodec")
@@ -231,6 +242,12 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--enable-avcodec".into(),
         "--enable-avutil".into(),
         "--enable-swscale".into(),
+        // libswresample — required by the audio_decoder crate for codecs
+        // whose native sample format isn't planar f32 (MP2 → s16p, AC-3 →
+        // fltp, E-AC-3 → fltp, Opus → fltp). The decoder normalises every
+        // codec to planar f32 so the bilbycast-edge audio path stays
+        // uniform.
+        "--enable-swresample".into(),
         // Video decoders
         "--enable-decoder=h264".into(),
         "--enable-decoder=hevc".into(),
@@ -241,6 +258,14 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--enable-encoder=libopus".into(),
         "--enable-encoder=mp2".into(),
         "--enable-encoder=ac3".into(),
+        // Audio decoders — feed the bilbycast-edge `display` output's
+        // ALSA backend through the new video-engine `AudioDecoder`. AAC
+        // stays on bilbycast-fdk-aac-rs (better quality, already in tree);
+        // these are the broadcast codecs FDK doesn't cover.
+        "--enable-decoder=mp2".into(),
+        "--enable-decoder=ac3".into(),
+        "--enable-decoder=eac3".into(),
+        "--enable-decoder=libopus".into(),
         // Static only
         "--enable-static".into(),
         "--disable-shared".into(),
@@ -436,9 +461,12 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
 }
 
 fn link_ffmpeg_libs(include_opus: bool) {
-    // Order matters: avcodec depends on avutil and swscale depends on avutil
+    // Order matters: avcodec depends on avutil; swscale and swresample
+    // both depend on avutil. swresample is consumed by the audio decoder
+    // for sample-format conversion.
     println!("cargo:rustc-link-lib=static=avcodec");
     println!("cargo:rustc-link-lib=static=swscale");
+    println!("cargo:rustc-link-lib=static=swresample");
     println!("cargo:rustc-link-lib=static=avutil");
 
     // libopus is statically linked into avcodec for the vendored build
