@@ -284,6 +284,12 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--disable-metal".into(),
         "--disable-audiotoolbox".into(),
         "--disable-videotoolbox".into(),
+        // libdrm autodetects from system headers; we don't use FFmpeg's
+        // DRM hwcontext (the bilbycast-edge `display` output drives KMS
+        // directly via the `drm` Rust crate). Leaving it on builds
+        // hwcontext_drm.o into libavutil and forces every downstream
+        // binary to link `-ldrm`. Disable it here.
+        "--disable-libdrm".into(),
         // Suppress assembly if nasm/yasm not available (fallback to C)
         "--disable-x86asm".into(),
     ];
