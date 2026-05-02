@@ -290,9 +290,25 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         // hwcontext_drm.o into libavutil and forces every downstream
         // binary to link `-ldrm`. Disable it here.
         "--disable-libdrm".into(),
-        // Suppress assembly if nasm/yasm not available (fallback to C)
-        "--disable-x86asm".into(),
     ];
+
+    // x86 assembly. The C-only fallback in libswscale (Lanczos / bilinear
+    // YUV→YUV downscale) corrupts the chroma planes on x86_64 — every
+    // thumbnail comes back with magenta-and-green stripe artifacts. So
+    // require nasm/yasm on x86_64 and enable assembly when present.
+    // On other architectures (ARM/AArch64), the C path is fine.
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "x86" || target_arch == "x86_64" {
+        let have_asm = which("nasm") || which("yasm");
+        if have_asm {
+            // Default behaviour — let configure auto-enable x86asm.
+        } else {
+            println!(
+                "cargo:warning=libffmpeg-video-sys: nasm/yasm not found on x86_64. The vendored FFmpeg will be built without x86 assembly, which causes libswscale to corrupt YUV downscale output (every thumbnail will come back with stripe artifacts). Install nasm: `sudo apt install nasm` (Debian/Ubuntu) or `brew install nasm` (macOS x86)."
+            );
+            configure_args.push("--disable-x86asm".into());
+        }
+    }
 
     // Aggregated pkg-config search path so FFmpeg's configure can find
     // every enabled optional library at once.
@@ -517,4 +533,27 @@ fn link_ffmpeg_libs(include_opus: bool) {
         }
         _ => {}
     }
+}
+
+/// True if `prog` resolves on PATH.
+fn which(prog: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(prog);
+        candidate.is_file() && {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&candidate)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+    })
 }
