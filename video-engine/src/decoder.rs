@@ -80,10 +80,24 @@ impl DecodedFrame {
     ///
     /// Returns `Some((y, y_stride, u, u_stride, v, v_stride))` when the
     /// pixel format is one of the planar YUV 4:2:0 / 4:2:2 / 4:4:4
-    /// variants (including the JPEG full-range siblings). The U / V
-    /// slices have height rounded up for 4:2:0 (half-height each).
+    /// variants (including the JPEG full-range siblings and the 10-bit
+    /// `*P10LE` variants). The chroma plane lengths reflect the format's
+    /// vertical sub-sampling — half-height for 4:2:0, full-height for
+    /// 4:2:2 / 4:4:4 — so callers can safely `.to_vec()` or otherwise
+    /// touch every byte without reading past the end of FFmpeg's
+    /// per-plane allocation.
     ///
-    /// Returns `None` for non-planar formats (RGB, 10-bit packed, etc).
+    /// **Memory safety**: an earlier revision returned chroma slices
+    /// of length `stride * full_height` for every layout, which made
+    /// 4:2:0 callers segfault when the over-sized slice was copied
+    /// (the over-read crossed the chroma plane's allocated end). The
+    /// segfault was reliably triggered on 3840x2160 yuv420p10le HEVC
+    /// frames in the local-display output's `drain_video_frames`. Fix:
+    /// dispatch off `frame.format` to compute the exact chroma height.
+    ///
+    /// Returns `None` for non-planar formats and for any format we
+    /// haven't taught the chroma-height table about — better to surface
+    /// "format unsupported here" than to over-read silently.
     pub fn yuv_planes(&self) -> Option<(&[u8], usize, &[u8], usize, &[u8], usize)> {
         unsafe {
             let frame = &*self.frame;
@@ -97,11 +111,25 @@ impl DecodedFrame {
             let u_stride = frame.linesize[1] as usize;
             let v_stride = frame.linesize[2] as usize;
             let h = frame.height as usize;
-            // For 4:2:0 the chroma planes are half-height; for 4:2:2 and
-            // 4:4:4 they are full-height. Over-allocate (return the
-            // maximum) rather than inspecting pix_fmt precisely — callers
-            // only index into `chroma_height * stride` anyway.
-            let chroma_rows = h; // upper bound
+            // Vertical sub-sampling factor: 2 for 4:2:0, 1 for 4:2:2 /
+            // 4:4:4. Round up so odd-height frames still fit (matches
+            // FFmpeg's own allocation: `(h + 1) / 2`).
+            let chroma_v_shift = match frame.format {
+                f if f == AVPixelFormat_AV_PIX_FMT_YUV420P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUVJ420P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV420P10LE
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV420P12LE => 1,
+                f if f == AVPixelFormat_AV_PIX_FMT_YUV422P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUVJ422P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV422P10LE
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV422P12LE
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV444P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUVJ444P
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV444P10LE
+                    || f == AVPixelFormat_AV_PIX_FMT_YUV444P12LE => 0,
+                _ => return None,
+            };
+            let chroma_rows = (h + (1 << chroma_v_shift) - 1) >> chroma_v_shift;
             Some((
                 std::slice::from_raw_parts(y_ptr, y_stride * h),
                 y_stride,
