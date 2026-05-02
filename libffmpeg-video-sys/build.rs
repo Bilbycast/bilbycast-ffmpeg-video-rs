@@ -104,6 +104,8 @@ fn main() {
         .allowlist_function("sws_getContext")
         .allowlist_function("sws_scale")
         .allowlist_function("sws_freeContext")
+        .allowlist_function("sws_setColorspaceDetails")
+        .allowlist_function("sws_getCoefficients")
         // ── swresample ──
         // Used by the audio decoder to normalise non-fltp source formats
         // (MP2 → s16p, AC-3 → fltp, Opus → fltp, etc.) into planar f32
@@ -122,12 +124,16 @@ fn main() {
         .allowlist_type("AVFrame")
         .allowlist_type("AVPacket")
         .allowlist_type("AVPixelFormat")
+        .allowlist_type("AVColorSpace")
+        .allowlist_type("AVColorRange")
         .allowlist_type("AVSampleFormat")
         .allowlist_type("AVChannelLayout")
         .allowlist_type("SwsContext")
         // ── Constants ──
         .allowlist_var("AV_CODEC_ID_.*")
         .allowlist_var("AV_PIX_FMT_.*")
+        .allowlist_var("AVCOL_SPC_.*")
+        .allowlist_var("AVCOL_RANGE_.*")
         .allowlist_var("AV_SAMPLE_FMT_.*")
         .allowlist_var("AV_CH_LAYOUT_.*")
         .allowlist_var("SWS_.*")

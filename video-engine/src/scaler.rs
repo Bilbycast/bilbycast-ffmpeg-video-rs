@@ -100,6 +100,7 @@ fn scaler_dst_pix_fmt(fmt: ScalerDstFormat) -> i32 {
         ScalerDstFormat::Yuvj420p => AVPixelFormat_AV_PIX_FMT_YUVJ420P,
         ScalerDstFormat::Yuv422p8 => AVPixelFormat_AV_PIX_FMT_YUV422P,
         ScalerDstFormat::Yuv422p10le => AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+        ScalerDstFormat::Bgra8 => AVPixelFormat_AV_PIX_FMT_BGRA,
     }
 }
 
@@ -310,6 +311,142 @@ impl VideoScaler {
 
     pub fn dst_format(&self) -> ScalerDstFormat {
         self.dst_format
+    }
+
+    /// Configure the YUV→RGB matrix the scaler uses. `src_colorspace` is an
+    /// `AVColorSpace` value from the decoded frame (e.g. `AVCOL_SPC_BT709`
+    /// for HD H.264). `src_full_range` selects PC (0–255) vs TV (16–235)
+    /// luma range (`AVCOL_RANGE_JPEG` vs `AVCOL_RANGE_MPEG`). No-op when
+    /// the destination format isn't packed RGB / BGR.
+    ///
+    /// Without this call, libswscale defaults to BT.601 for SD-shaped
+    /// inputs, which produces muddy greens / oversaturated reds on a
+    /// BT.709 HD source decoded from H.264.
+    pub fn set_yuv_to_rgb_colorspace(&self, src_colorspace: i32, src_full_range: bool) {
+        if !matches!(self.dst_format, ScalerDstFormat::Bgra8) {
+            return;
+        }
+        unsafe {
+            let inv_table = sws_getCoefficients(src_colorspace);
+            let table = sws_getCoefficients(AVColorSpace_AVCOL_SPC_BT709 as i32);
+            // RGB output is always full-range. brightness=0, contrast=1<<16,
+            // saturation=1<<16 in 16.16 fixed-point.
+            sws_setColorspaceDetails(
+                self.ctx,
+                inv_table,
+                if src_full_range { 1 } else { 0 },
+                table,
+                1,
+                0,
+                1 << 16,
+                1 << 16,
+            );
+        }
+    }
+
+    /// Like [`Self::scale_into_packed`] but takes raw planar YUV slices
+    /// instead of a [`DecodedFrame`]. Used by the display sink, which
+    /// already moves planes through an mpsc channel and doesn't have a
+    /// live [`DecodedFrame`] handle by the time the blit runs.
+    ///
+    /// `src_w` / `src_h` / `src_format` describe the source planes and
+    /// must agree with what the scaler was constructed for. The
+    /// destination format must be packed (currently `Bgra8`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_raw_planes_into_packed(
+        &self,
+        src_w: u32,
+        src_h: u32,
+        src_format: i32,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        u_stride: usize,
+        v: &[u8],
+        v_stride: usize,
+        dst: &mut [u8],
+        dst_pitch: usize,
+    ) -> Result<(), VideoError> {
+        if !matches!(self.dst_format, ScalerDstFormat::Bgra8) {
+            return Err(VideoError::InvalidInput(
+                "scale_raw_planes_into_packed requires a packed destination format",
+            ));
+        }
+        let needed = dst_pitch.saturating_mul(self.dst_height as usize);
+        if dst.len() < needed {
+            return Err(VideoError::InvalidInput(
+                "destination buffer smaller than dst_pitch * dst_height",
+            ));
+        }
+        let _ = (src_w, src_h, src_format); // shape is locked at scaler construction
+        unsafe {
+            let mut src_data: [*const u8; 4] = [std::ptr::null(); 4];
+            let mut src_linesize: [i32; 4] = [0; 4];
+            src_data[0] = y.as_ptr();
+            src_data[1] = u.as_ptr();
+            src_data[2] = v.as_ptr();
+            src_linesize[0] = y_stride as i32;
+            src_linesize[1] = u_stride as i32;
+            src_linesize[2] = v_stride as i32;
+
+            let mut dst_data: [*mut u8; 4] = [std::ptr::null_mut(); 4];
+            let mut dst_linesize: [i32; 4] = [0; 4];
+            dst_data[0] = dst.as_mut_ptr();
+            dst_linesize[0] = dst_pitch as i32;
+
+            sws_scale(
+                self.ctx,
+                src_data.as_ptr(),
+                src_linesize.as_ptr(),
+                0,
+                src_h as i32,
+                dst_data.as_ptr() as *const *mut u8,
+                dst_linesize.as_ptr(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Scale a decoded frame straight into a caller-provided packed
+    /// destination buffer (one plane, `dst_pitch` bytes per row).
+    /// Designed for the display sink: the destination is the mapped
+    /// KMS dumb buffer, so libswscale writes directly into the
+    /// framebuffer with no intermediate copy. Only valid when the
+    /// destination format is packed (currently `Bgra8`).
+    pub fn scale_into_packed(
+        &self,
+        src: &DecodedFrame,
+        dst: &mut [u8],
+        dst_pitch: usize,
+    ) -> Result<(), VideoError> {
+        if !matches!(self.dst_format, ScalerDstFormat::Bgra8) {
+            return Err(VideoError::InvalidInput(
+                "scale_into_packed requires a packed destination format",
+            ));
+        }
+        let needed = dst_pitch.saturating_mul(self.dst_height as usize);
+        if dst.len() < needed {
+            return Err(VideoError::InvalidInput(
+                "destination buffer smaller than dst_pitch * dst_height",
+            ));
+        }
+        unsafe {
+            let src_frame = src.as_ptr();
+            let mut dst_data: [*mut u8; 4] = [std::ptr::null_mut(); 4];
+            let mut dst_linesize: [i32; 4] = [0; 4];
+            dst_data[0] = dst.as_mut_ptr();
+            dst_linesize[0] = dst_pitch as i32;
+            sws_scale(
+                self.ctx,
+                (*src_frame).data.as_ptr() as *const *const u8,
+                (*src_frame).linesize.as_ptr(),
+                0,
+                (*src_frame).height,
+                dst_data.as_ptr() as *const *mut u8,
+                dst_linesize.as_ptr(),
+            );
+        }
+        Ok(())
     }
 }
 

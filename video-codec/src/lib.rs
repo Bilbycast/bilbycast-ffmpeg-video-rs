@@ -77,6 +77,11 @@ pub enum ScalerDstFormat {
     Yuv422p8,
     /// Planar YUV 4:2:2, 10-bit little-endian. Broadcast 10-bit.
     Yuv422p10le,
+    /// Packed BGRA 8-bit (`B G R A` byte order in memory). Matches the
+    /// XRGB8888 little-endian framebuffer layout used by Linux KMS dumb
+    /// buffers, so a single `sws_scale` writes pixels straight onto the
+    /// display.
+    Bgra8,
 }
 
 /// Configuration for thumbnail generation.
@@ -632,4 +637,10 @@ pub enum VideoError {
     /// Failed to allocate packet.
     #[error("failed to allocate packet")]
     AllocPacket,
+
+    /// Caller passed an argument that doesn't match the configured scaler
+    /// (e.g. a packed-RGB API used with a planar destination, or a
+    /// destination buffer too small for the configured output size).
+    #[error("invalid input: {0}")]
+    InvalidInput(&'static str),
 }

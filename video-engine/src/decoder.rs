@@ -48,6 +48,21 @@ impl DecodedFrame {
         unsafe { (*self.frame).format }
     }
 
+    /// `AVColorSpace` (YUV→RGB matrix selector). Returns the FFmpeg
+    /// `AVCOL_SPC_*` integer drawn from the decoded frame's VUI, or
+    /// `AVCOL_SPC_UNSPECIFIED` when the bitstream did not signal it —
+    /// callers must fall back to a sensible default per source size.
+    pub fn colorspace(&self) -> i32 {
+        unsafe { (*self.frame).colorspace as i32 }
+    }
+
+    /// `true` when the source is full-range (`AVCOL_RANGE_JPEG`); `false`
+    /// when limited-range (`AVCOL_RANGE_MPEG` or unspecified, the broadcast
+    /// default).
+    pub fn is_full_range(&self) -> bool {
+        unsafe { (*self.frame).color_range == 2 }
+    }
+
     /// Whether this frame is a keyframe.
     pub fn is_keyframe(&self) -> bool {
         unsafe { (*self.frame).key_frame != 0 }

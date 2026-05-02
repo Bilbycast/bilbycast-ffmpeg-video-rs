@@ -28,7 +28,7 @@ pub mod video_encoder;
 pub use audio_decoder::{AudioDecoder, DecodedAudioFrame};
 pub use audio_encoder::AudioEncoder;
 pub use decoder::{DecodedFrame, VideoDecoder};
-pub use video_codec::VideoCodec;
+pub use video_codec::{ScalerDstFormat, VideoCodec};
 pub use encoder::JpegEncoder;
 pub use probe::{is_decoder_available, is_encoder_available};
 pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
