@@ -68,6 +68,23 @@ impl DecodedFrame {
         unsafe { (*self.frame).key_frame != 0 }
     }
 
+    /// Per-frame PTS in the timebase the caller supplied to
+    /// [`VideoDecoder::send_packet_with_pts`]. FFmpeg propagates the
+    /// input packet's PTS through the decoder's internal reorder
+    /// queue, so this is the **display-order** PTS of the frame —
+    /// callers don't have to deal with B-frame reorder themselves.
+    /// Returns `None` when the input had no PTS attached
+    /// (`AV_NOPTS_VALUE` sentinel).
+    pub fn pts(&self) -> Option<i64> {
+        let raw = unsafe { (*self.frame).pts };
+        // AV_NOPTS_VALUE = INT64_MIN per FFmpeg headers.
+        if raw == i64::MIN {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
     /// Raw pointer to the underlying AVFrame.
     ///
     /// # Safety
@@ -265,6 +282,25 @@ impl VideoDecoder {
     ///
     /// After sending, call [`receive_frame`] to retrieve decoded frames.
     pub fn send_packet(&mut self, data: &[u8]) -> Result<(), VideoError> {
+        // No-PTS path. Set both pts and dts to AV_NOPTS_VALUE so the
+        // packet doesn't carry a stale value from a previous send.
+        self.send_packet_inner(data, i64::MIN)
+    }
+
+    /// Same as [`send_packet`] but attaches a presentation timestamp to
+    /// the input packet. FFmpeg propagates `pkt.pts` → `frame.pts`
+    /// through the decoder's reorder queue, so callers can read each
+    /// decoded frame's true display-order PTS via
+    /// [`DecodedFrame::pts`]. Required for any consumer that has to
+    /// schedule frame display against an audio master clock — e.g.
+    /// the local-display output, where every decoded frame in a GOP
+    /// otherwise inherits the same most-recent input PTS and the
+    /// audio dup/drop logic misfires on every B-frame.
+    pub fn send_packet_with_pts(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError> {
+        self.send_packet_inner(data, pts)
+    }
+
+    fn send_packet_inner(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError> {
         if data.is_empty() {
             return Err(VideoError::EmptyInput);
         }
@@ -272,6 +308,13 @@ impl VideoDecoder {
         unsafe {
             (*self.packet).data = data.as_ptr() as *mut u8;
             (*self.packet).size = data.len() as i32;
+            (*self.packet).pts = pts;
+            // DTS doesn't matter to a pull-mode decoder when the bit-
+            // stream's own DTS is implicit (we only feed complete
+            // access units), but FFmpeg complains in some paths if dts
+            // is set while pts is not. Mirror pts so the two stay in
+            // sync — the decoder uses pts for frame ordering anyway.
+            (*self.packet).dts = pts;
 
             let ret = avcodec_send_packet(self.ctx, self.packet);
             if ret < 0 {

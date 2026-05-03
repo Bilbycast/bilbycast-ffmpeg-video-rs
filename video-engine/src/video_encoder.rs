@@ -150,6 +150,16 @@ impl VideoEncoder {
                     "NVENC backends do not support chroma=yuv444p".into(),
                 ));
             }
+            if config.chroma == VideoChroma::Yuv422 {
+                // NVENC has no 4:2:2 input path on any GPU generation
+                // (Pascal through Ada Lovelace) — both H.264 and HEVC
+                // are 4:2:0 + 4:4:4 only. Reject up front so the
+                // operator gets a clear error instead of an opaque
+                // avcodec_open2 EINVAL at first frame.
+                return Err(VideoEncoderError::InvalidInput(
+                    "NVENC backends do not support chroma=yuv422p (NVENC is 4:2:0 / 4:4:4 only)".into(),
+                ));
+            }
         }
         // QSV's pixel-format matrix is similar to NVENC: h264_qsv is
         // 8-bit only (use hevc_qsv for 10-bit on supported hardware), and
