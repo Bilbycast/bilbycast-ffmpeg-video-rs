@@ -1,6 +1,6 @@
 [package]
 name = "libffmpeg-video-sys"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MPL-2.0"
 description = "Raw FFI bindings to FFmpeg libavcodec/libavutil/libswscale/libswresample for video decode, scale, JPEG encode, and audio encode/decode (Opus/MP2/AC-3/E-AC-3)"
