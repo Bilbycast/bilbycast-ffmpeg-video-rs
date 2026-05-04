@@ -36,7 +36,7 @@ pub use probe::{
     ProbeChroma, ProbeError,
 };
 pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
-pub use thumbnail::decode_thumbnail;
+pub use thumbnail::{decode_thumbnail, decode_thumbnail_packets};
 pub use video_encoder::VideoEncoder;
 
 /// Silence FFmpeg's internal logging. Call once at startup.

@@ -133,6 +133,117 @@ pub fn decode_thumbnail(
     })
 }
 
+/// Decode a thumbnail from a per-access-unit packet sequence.
+///
+/// `decode_thumbnail` feeds the decoder one big concatenated Annex B blob.
+/// That works for every input we tested historically because the codec's
+/// internal NAL parser still walks the bytes correctly — but it falls
+/// apart on open-GOP broadcast streams that use non-IDR I-slices with a
+/// `recovery_point` SEI for random access (DVB-T 1080i25 is the canonical
+/// case): without per-AU framing the decoder cannot match the SEI to the
+/// slice that follows and never produces a picture. The mpegts demuxer
+/// inside ffmpeg avoids this by feeding one PES per `avcodec_send_packet`,
+/// and that's what this function does — the upstream `TsDemuxer` already
+/// surfaces complete access units with their PTS.
+///
+/// `headers` is an optional Annex B blob containing decoder configuration
+/// NALUs (H.264: SPS+PPS; HEVC: VPS+SPS+PPS). Sent first with no PTS so
+/// the decoder has parameter sets in place before any VCL slice arrives.
+/// `&[]` is fine when the parameter sets ride inline with the first AU.
+///
+/// `packets` is the access-unit sequence in decode order. Each `(au, pts)`
+/// pair is sent as its own packet via `send_packet_with_pts`. PTS is in
+/// 90 kHz ticks. After all packets the decoder is flushed and every
+/// produced frame is consumed; the most recent one wins (matches what an
+/// operator expects in the live preview).
+///
+/// Returns `Err(NeedMoreInput)` when the decoder produced no frame —
+/// callers treat that as a soft failure and wait for more data.
+///
+/// Like [`decode_thumbnail`], this is synchronous FFmpeg work; wrap it in
+/// `tokio::task::spawn_blocking` from async contexts.
+pub fn decode_thumbnail_packets(
+    headers: &[u8],
+    packets: &[(Vec<u8>, i64)],
+    codec: VideoCodec,
+    config: &ThumbnailConfig,
+) -> Result<ThumbnailResult, VideoError> {
+    if packets.iter().all(|(au, _)| au.is_empty()) && headers.is_empty() {
+        return Err(VideoError::EmptyInput);
+    }
+
+    let mut decoder = VideoDecoder::open(codec)?;
+    let mut latest: Option<crate::decoder::DecodedFrame> = None;
+
+    // Parameter sets first — non-VCL, no PTS, never produce a picture.
+    // Errors are swallowed: a bad headers blob just leaves the decoder
+    // uninitialised, and the first VCL packet retries parameter parsing
+    // on its own (broadcast streams often re-send SPS/PPS before each I).
+    if !headers.is_empty() {
+        let _ = decoder.send_packet(headers);
+        loop {
+            match decoder.receive_frame() {
+                Ok(frame) => latest = Some(frame),
+                Err(VideoError::NeedMoreInput) | Err(VideoError::Eof) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    for (au, pts) in packets {
+        if au.is_empty() {
+            continue;
+        }
+        if decoder.send_packet_with_pts(au, *pts).is_err() {
+            continue;
+        }
+        loop {
+            match decoder.receive_frame() {
+                Ok(frame) => latest = Some(frame),
+                Err(VideoError::NeedMoreInput) | Err(VideoError::Eof) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Drain the reorder queue. Any B-frame waiting for a future reference
+    // is released here, becoming the freshest decoded picture.
+    if decoder.send_flush().is_ok() {
+        loop {
+            match decoder.receive_frame() {
+                Ok(frame) => latest = Some(frame),
+                Err(VideoError::Eof) | Err(VideoError::NeedMoreInput) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    let frame = latest.ok_or(VideoError::NeedMoreInput)?;
+
+    let luminance = frame.average_luminance();
+    let source_width = frame.width();
+    let source_height = frame.height();
+
+    let scaler = VideoScaler::new(
+        source_width,
+        source_height,
+        frame.pixel_format(),
+        config.width,
+        config.height,
+    )?;
+    let scaled = scaler.scale(&frame)?;
+
+    let encoder = JpegEncoder::new(config.quality);
+    let jpeg = encoder.encode(&scaled)?;
+
+    Ok(ThumbnailResult {
+        jpeg,
+        luminance,
+        source_width,
+        source_height,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
