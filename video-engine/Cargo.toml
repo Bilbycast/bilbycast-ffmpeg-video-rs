@@ -1,6 +1,6 @@
 [package]
 name = "video-engine"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "Safe Rust wrapper around FFmpeg for video decode, scale, JPEG encode, and audio encode/decode (Opus/MP2/AC-3/E-AC-3)"
@@ -15,6 +15,16 @@ video-encoder-x264 = ["libffmpeg-video-sys/video-encoder-x264"]
 video-encoder-x265 = ["libffmpeg-video-sys/video-encoder-x265"]
 video-encoder-nvenc = ["libffmpeg-video-sys/video-encoder-nvenc"]
 video-encoder-qsv = ["libffmpeg-video-sys/video-encoder-qsv"]
+# Hardware-decode features — symmetric with the encoder set above. Each
+# enables compiled-in support for one HW decoder family in
+# `VideoDecoder::open_with_backend`. Off by default so generic builds
+# stay portable. Build prerequisites:
+# - `video-decoder-nvdec`: nv-codec-headers (same dep as NVENC) +
+#   NVIDIA driver at runtime.
+# - `video-decoder-qsv`:   libvpl-dev (same dep as QSV encode) + Intel
+#   media driver at runtime; x86_64 only.
+video-decoder-nvdec = ["libffmpeg-video-sys/video-decoder-nvdec"]
+video-decoder-qsv = ["libffmpeg-video-sys/video-decoder-qsv"]
 
 [dependencies]
 libffmpeg-video-sys = { path = "../libffmpeg-video-sys" }

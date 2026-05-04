@@ -27,7 +27,7 @@ pub mod video_encoder;
 
 pub use audio_decoder::{AudioDecoder, DecodedAudioFrame};
 pub use audio_encoder::AudioEncoder;
-pub use decoder::{DecodedFrame, VideoDecoder};
+pub use decoder::{DecodedFrame, DecoderBackend, VideoDecoder};
 pub use video_codec::{ScalerDstFormat, VideoCodec};
 pub use encoder::JpegEncoder;
 pub use probe::{

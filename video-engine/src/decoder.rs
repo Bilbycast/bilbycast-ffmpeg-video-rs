@@ -15,6 +15,46 @@
 use libffmpeg_video_sys::*;
 use video_codec::{VideoCodec, VideoError};
 
+/// Decoder backend — selects which FFmpeg decoder family `VideoDecoder`
+/// opens against. `Cpu` is the always-available libavcodec software
+/// path; the hardware variants need their corresponding Cargo features
+/// (`video-decoder-nvdec`, `video-decoder-qsv`) AND a working driver +
+/// hardware at runtime — open will return `EncoderDisabled` /
+/// `OpenCodec` when the host can't satisfy the request.
+///
+/// HW frames come back in NV12 system memory by default — the cuvid /
+/// QSV decoders auto-download to host memory via FFmpeg's built-in
+/// hwframe transfer. Callers pick up the layout via
+/// [`DecodedFrame::pixel_format`] and either use [`DecodedFrame::yuv_planes`]
+/// (planar YUV) or [`DecodedFrame::nv12_planes`] (semi-planar NV12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderBackend {
+    /// libavcodec software decoder. Always available.
+    Cpu,
+    /// NVIDIA NVDEC via `h264_cuvid` / `hevc_cuvid`. Needs the
+    /// `video-decoder-nvdec` Cargo feature.
+    Nvdec,
+    /// Intel QuickSync via `h264_qsv` / `hevc_qsv`. Needs the
+    /// `video-decoder-qsv` Cargo feature.
+    Qsv,
+}
+
+impl DecoderBackend {
+    /// FFmpeg decoder name for this backend + codec, or `None` for
+    /// `Cpu` (which uses `avcodec_find_decoder` with the codec ID, not
+    /// a name lookup). Used by [`VideoDecoder::open_with_backend`] and
+    /// the runtime probe in `probe.rs`.
+    pub fn ffmpeg_decoder_name(self, codec: VideoCodec) -> Option<&'static str> {
+        match (self, codec) {
+            (DecoderBackend::Cpu, _) => None,
+            (DecoderBackend::Nvdec, VideoCodec::H264) => Some("h264_cuvid"),
+            (DecoderBackend::Nvdec, VideoCodec::Hevc) => Some("hevc_cuvid"),
+            (DecoderBackend::Qsv, VideoCodec::H264) => Some("h264_qsv"),
+            (DecoderBackend::Qsv, VideoCodec::Hevc) => Some("hevc_qsv"),
+        }
+    }
+}
+
 /// AVERROR_EOF = -FFERRTAG('E','O','F',' ')
 const AVERROR_EOF: i32 = -541478725;
 
@@ -158,6 +198,45 @@ impl DecodedFrame {
         }
     }
 
+    /// Access the two planes of an NV12 frame (Y + interleaved UV).
+    ///
+    /// Returns `Some((y, y_stride, uv, uv_stride))` when the pixel
+    /// format is `AV_PIX_FMT_NV12` — the default system-memory output
+    /// of `h264_cuvid` / `hevc_cuvid` / `h264_qsv` / `hevc_qsv`. The UV
+    /// plane is half-height (4:2:0 chroma sub-sampling) and contains
+    /// interleaved U/V byte pairs at full chroma width — i.e. one CbCr
+    /// pair per 2×2 luma block.
+    ///
+    /// Returns `None` for any other format. Callers in the display
+    /// path use this accessor when [`pixel_format`] reports NV12 and
+    /// fall back to [`yuv_planes`] for planar YUV (the CPU decoder
+    /// path).
+    pub fn nv12_planes(&self) -> Option<(&[u8], usize, &[u8], usize)> {
+        unsafe {
+            let frame = &*self.frame;
+            if frame.format != AVPixelFormat_AV_PIX_FMT_NV12 {
+                return None;
+            }
+            let y_ptr = frame.data[0];
+            let uv_ptr = frame.data[1];
+            if y_ptr.is_null() || uv_ptr.is_null() {
+                return None;
+            }
+            let y_stride = frame.linesize[0] as usize;
+            let uv_stride = frame.linesize[1] as usize;
+            let h = frame.height as usize;
+            // 4:2:0 chroma: half-height. Round up so odd-height frames
+            // still fit (mirrors `yuv_planes()` rounding).
+            let chroma_rows = (h + 1) >> 1;
+            Some((
+                std::slice::from_raw_parts(y_ptr, y_stride * h),
+                y_stride,
+                std::slice::from_raw_parts(uv_ptr, uv_stride * chroma_rows),
+                uv_stride,
+            ))
+        }
+    }
+
     /// Access the Y (luma) plane data for black-screen detection.
     ///
     /// Returns the Y plane bytes and the line stride. For planar YUV formats,
@@ -234,15 +313,49 @@ pub struct VideoDecoder {
 unsafe impl Send for VideoDecoder {}
 
 impl VideoDecoder {
-    /// Open a decoder for the specified video codec.
+    /// Open a software (libavcodec) decoder for the specified video codec.
+    ///
+    /// Equivalent to [`open_with_backend`] with `DecoderBackend::Cpu`.
     pub fn open(codec: VideoCodec) -> Result<Self, VideoError> {
-        let codec_id = match codec {
-            VideoCodec::H264 => AVCodecID_AV_CODEC_ID_H264,
-            VideoCodec::Hevc => AVCodecID_AV_CODEC_ID_HEVC,
-        };
+        Self::open_with_backend(codec, DecoderBackend::Cpu)
+    }
 
+    /// Open a decoder for the specified video codec, selecting the
+    /// backend (software libavcodec or one of the hardware families
+    /// gated on the matching Cargo feature).
+    ///
+    /// `DecoderBackend::Cpu` always succeeds when the codec is
+    /// compiled in. HW backends fail with `VideoError::CodecNotFound`
+    /// when the matching `video-decoder-*` Cargo feature is off, and
+    /// with `VideoError::OpenCodec` when the host lacks the driver /
+    /// hardware / permissions to instantiate a session.
+    pub fn open_with_backend(
+        codec: VideoCodec,
+        backend: DecoderBackend,
+    ) -> Result<Self, VideoError> {
         unsafe {
-            let av_codec = avcodec_find_decoder(codec_id);
+            let av_codec = match backend {
+                DecoderBackend::Cpu => {
+                    let codec_id = match codec {
+                        VideoCodec::H264 => AVCodecID_AV_CODEC_ID_H264,
+                        VideoCodec::Hevc => AVCodecID_AV_CODEC_ID_HEVC,
+                    };
+                    avcodec_find_decoder(codec_id)
+                }
+                DecoderBackend::Nvdec | DecoderBackend::Qsv => {
+                    // HW backends are name-keyed (`h264_cuvid`, `hevc_qsv`,
+                    // ...). Look up the name; non-NULL result means the
+                    // matching `--enable-decoder=*` was passed to FFmpeg
+                    // configure, which corresponds to the Cargo feature
+                    // being on.
+                    let Some(name) = backend.ffmpeg_decoder_name(codec) else {
+                        return Err(VideoError::CodecNotFound(codec));
+                    };
+                    let cstr = std::ffi::CString::new(name)
+                        .map_err(|_| VideoError::CodecNotFound(codec))?;
+                    avcodec_find_decoder_by_name(cstr.as_ptr())
+                }
+            };
             if av_codec.is_null() {
                 return Err(VideoError::CodecNotFound(codec));
             }
@@ -252,7 +365,10 @@ impl VideoDecoder {
                 return Err(VideoError::AllocContext);
             }
 
-            // Allow truncated packets (common in TS streams)
+            // Allow truncated packets (common in TS streams). Safe on
+            // the cuvid / QSV decoders too — they buffer NAL units
+            // internally and tolerate the same partial-packet feeding
+            // pattern as the SW decoder.
             (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
 
             let ret = avcodec_open2(ctx, av_codec, std::ptr::null_mut());
@@ -434,5 +550,61 @@ mod tests {
         let mut dec = VideoDecoder::open(VideoCodec::H264).unwrap();
         let result = dec.send_packet(&[]);
         assert!(matches!(result, Err(VideoError::EmptyInput)));
+    }
+
+    #[test]
+    fn open_with_backend_cpu_matches_open() {
+        // Regression check: `open(codec)` must remain a thin wrapper
+        // over `open_with_backend(codec, Cpu)`. Both must succeed for
+        // H.264 and HEVC on every host.
+        init();
+        let _h264 = VideoDecoder::open_with_backend(VideoCodec::H264, DecoderBackend::Cpu)
+            .expect("Cpu H.264 should always open");
+        let _hevc = VideoDecoder::open_with_backend(VideoCodec::Hevc, DecoderBackend::Cpu)
+            .expect("Cpu HEVC should always open");
+    }
+
+    #[test]
+    fn nvdec_unavailable_when_feature_off() {
+        init();
+        // When the `video-decoder-nvdec` feature is off, looking up
+        // `h264_cuvid` returns NULL and the open surfaces
+        // `CodecNotFound`. Caller (display output's resolver) can
+        // distinguish this from "host has no NVIDIA GPU" by reading
+        // the `ProbeError` returned by the startup probe — but at the
+        // open layer, a missing FFmpeg-side decoder presents as
+        // `CodecNotFound`.
+        #[cfg(not(feature = "video-decoder-nvdec"))]
+        {
+            let result = VideoDecoder::open_with_backend(
+                VideoCodec::H264,
+                DecoderBackend::Nvdec,
+            );
+            assert!(matches!(result, Err(VideoError::CodecNotFound(_))));
+        }
+    }
+
+    #[test]
+    fn ffmpeg_decoder_name_mapping() {
+        assert_eq!(
+            DecoderBackend::Cpu.ffmpeg_decoder_name(VideoCodec::H264),
+            None
+        );
+        assert_eq!(
+            DecoderBackend::Nvdec.ffmpeg_decoder_name(VideoCodec::H264),
+            Some("h264_cuvid")
+        );
+        assert_eq!(
+            DecoderBackend::Nvdec.ffmpeg_decoder_name(VideoCodec::Hevc),
+            Some("hevc_cuvid")
+        );
+        assert_eq!(
+            DecoderBackend::Qsv.ffmpeg_decoder_name(VideoCodec::H264),
+            Some("h264_qsv")
+        );
+        assert_eq!(
+            DecoderBackend::Qsv.ffmpeg_decoder_name(VideoCodec::Hevc),
+            Some("hevc_qsv")
+        );
     }
 }

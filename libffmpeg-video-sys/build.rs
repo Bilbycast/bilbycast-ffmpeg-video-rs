@@ -369,27 +369,46 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-encoder=libx265".into());
     }
 
-    if cfg!(feature = "video-encoder-nvenc") {
-        // NVENC is a header-only interface plus runtime driver. The
-        // FFmpeg-side headers live in nv-codec-headers; we expect them
-        // to be discoverable by pkg-config name "ffnvcodec". `--enable-nonfree`
-        // is not strictly required for NVENC headers but is commonly
-        // combined with it in distributions.
+    // NVENC encoder + NVDEC decoder share `nv-codec-headers` + the
+    // NVIDIA proprietary runtime driver. Probe pkg-config once when
+    // either feature is on so we don't re-probe on combined builds.
+    let nv_required = cfg!(feature = "video-encoder-nvenc")
+        || cfg!(feature = "video-decoder-nvdec");
+    if nv_required {
         let nv = pkg_config::Config::new().probe("ffnvcodec").expect(
             "pkg-config: ffnvcodec not found. \
              Install nv-codec-headers and the NVIDIA driver to build with \
-             the video-encoder-nvenc feature.",
+             the video-encoder-nvenc / video-decoder-nvdec features.",
         );
         for inc in &nv.include_paths {
             extra_cflags.push(' ');
             extra_cflags.push_str(&format!("-I{}", inc.display()));
         }
+    }
+
+    if cfg!(feature = "video-encoder-nvenc") {
         configure_args.push("--enable-nvenc".into());
         configure_args.push("--enable-encoder=h264_nvenc".into());
         configure_args.push("--enable-encoder=hevc_nvenc".into());
     }
 
-    if cfg!(feature = "video-encoder-qsv") {
+    if cfg!(feature = "video-decoder-nvdec") {
+        // CUVID is the FFmpeg name for the NVDEC-driven decoders. The
+        // `--enable-cuvid` flag wires up the codec parsers + bitstream
+        // filters; the per-codec `--enable-decoder=*_cuvid` lines pull
+        // in the actual decoder entries (`h264_cuvid`, `hevc_cuvid`).
+        // No `--enable-nonfree` needed — the cuvid headers are
+        // permissive at the FFmpeg layer.
+        configure_args.push("--enable-cuvid".into());
+        configure_args.push("--enable-decoder=h264_cuvid".into());
+        configure_args.push("--enable-decoder=hevc_cuvid".into());
+    }
+
+    // QSV encoder + decoder share libvpl. Probe pkg-config once when
+    // either feature is on. `--enable-libvpl` is also added once.
+    let vpl_required = cfg!(feature = "video-encoder-qsv")
+        || cfg!(feature = "video-decoder-qsv");
+    if vpl_required {
         // Intel QuickSync via oneVPL (libvpl). Modern path — replaces the
         // legacy MediaSDK / `--enable-libmfx`. Headers + dispatcher are
         // MIT/Apache; no `--enable-nonfree` needed. The pkg-config module
@@ -397,7 +416,7 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         let vpl = pkg_config::Config::new().probe("vpl").expect(
             "pkg-config: vpl not found. \
              Install libvpl-dev (Debian/Ubuntu 24.04+) to build with the \
-             video-encoder-qsv feature.",
+             video-encoder-qsv / video-decoder-qsv features.",
         );
         for inc in &vpl.include_paths {
             extra_cflags.push(' ');
@@ -409,8 +428,16 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             pkgconfig_paths.push(lp.join("pkgconfig"));
         }
         configure_args.push("--enable-libvpl".into());
+    }
+
+    if cfg!(feature = "video-encoder-qsv") {
         configure_args.push("--enable-encoder=h264_qsv".into());
         configure_args.push("--enable-encoder=hevc_qsv".into());
+    }
+
+    if cfg!(feature = "video-decoder-qsv") {
+        configure_args.push("--enable-decoder=h264_qsv".into());
+        configure_args.push("--enable-decoder=hevc_qsv".into());
     }
 
     // Extra cflags / ldflags must be passed last (accumulated across
@@ -529,7 +556,10 @@ fn link_ffmpeg_libs(include_opus: bool) {
         "linux" => {
             println!("cargo:rustc-link-lib=m");
             println!("cargo:rustc-link-lib=pthread");
-            if cfg!(feature = "video-encoder-nvenc") {
+            // NVENC + NVDEC both load `libnvcuvid.so.1` / `libnvidia-encode.so.1`
+            // dynamically through `dlopen` at runtime, so `-ldl` is required
+            // whenever either feature is on.
+            if cfg!(feature = "video-encoder-nvenc") || cfg!(feature = "video-decoder-nvdec") {
                 println!("cargo:rustc-link-lib=dl");
             }
         }
