@@ -298,6 +298,21 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--disable-libdrm".into(),
     ];
 
+    // VAAPI auto-detects from `libva` on the host. Even when the
+    // operator hasn't enabled `video-encoder-vaapi` / `video-decoder-vaapi`,
+    // a build host that ships libva (typical Mesa / Intel driver
+    // install on Linux) makes FFmpeg pull `hwcontext_vaapi.o` into
+    // libavutil and `vaapi_*` references into every linked binary.
+    // Without `libva-dev` headers / `pkg-config` lookups completing
+    // the link side, the final `bilbycast-edge` link fails with
+    // `undefined reference to vaInitialize` etc. Force VAAPI off
+    // unless an explicit VAAPI feature was selected — those branches
+    // run libva probes below and append `--enable-vaapi`.
+    if !cfg!(feature = "video-encoder-vaapi") && !cfg!(feature = "video-decoder-vaapi")
+    {
+        configure_args.push("--disable-vaapi".into());
+    }
+
     // x86 assembly. The C-only fallback in libswscale (Lanczos / bilinear
     // YUV→YUV downscale) corrupts the chroma planes on x86_64 — every
     // thumbnail comes back with magenta-and-green stripe artifacts. So
@@ -440,6 +455,50 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-decoder=hevc_qsv".into());
     }
 
+    // VAAPI encoder + decoder share libva. Probe pkg-config once when
+    // either feature is on. VAAPI on Linux opens render nodes
+    // (`/dev/dri/renderD*`) via libva-drm; FFmpeg's `--enable-vaapi`
+    // pulls in libva-drm automatically when libdrm is detected, and the
+    // build needs both `libva` and `libva-drm` system libraries linked
+    // into the final binary because FFmpeg's static archives don't
+    // contain them.
+    let va_required = cfg!(feature = "video-encoder-vaapi")
+        || cfg!(feature = "video-decoder-vaapi");
+    if va_required {
+        let va = pkg_config::Config::new().probe("libva").expect(
+            "pkg-config: libva not found. \
+             Install libva-dev (Debian/Ubuntu) to build with the \
+             video-encoder-vaapi / video-decoder-vaapi features.",
+        );
+        for inc in &va.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        for lp in &va.link_paths {
+            extra_ldflags.push(' ');
+            extra_ldflags.push_str(&format!("-L{}", lp.display()));
+            pkgconfig_paths.push(lp.join("pkgconfig"));
+        }
+        // libva-drm is a separate pkg-config module; required for
+        // `vaGetDisplayDRM` which is how FFmpeg opens render nodes.
+        let _va_drm = pkg_config::Config::new().probe("libva-drm").expect(
+            "pkg-config: libva-drm not found. \
+             Install libva-dev (it ships libva-drm.pc) to build with the \
+             video-encoder-vaapi / video-decoder-vaapi features.",
+        );
+        configure_args.push("--enable-vaapi".into());
+    }
+
+    if cfg!(feature = "video-encoder-vaapi") {
+        configure_args.push("--enable-encoder=h264_vaapi".into());
+        configure_args.push("--enable-encoder=hevc_vaapi".into());
+    }
+
+    if cfg!(feature = "video-decoder-vaapi") {
+        configure_args.push("--enable-decoder=h264_vaapi".into());
+        configure_args.push("--enable-decoder=hevc_vaapi".into());
+    }
+
     // Extra cflags / ldflags must be passed last (accumulated across
     // every optional dep above).
     configure_args.push(format!("--extra-cflags={extra_cflags}"));
@@ -561,6 +620,14 @@ fn link_ffmpeg_libs(include_opus: bool) {
             // whenever either feature is on.
             if cfg!(feature = "video-encoder-nvenc") || cfg!(feature = "video-decoder-nvdec") {
                 println!("cargo:rustc-link-lib=dl");
+            }
+            // VAAPI: libva (the dispatch core) + libva-drm (render-node
+            // backend FFmpeg uses to open `/dev/dri/renderD*`). FFmpeg
+            // static archives reference these symbols; final-binary link
+            // resolves them from the system shared libraries.
+            if cfg!(feature = "video-encoder-vaapi") || cfg!(feature = "video-decoder-vaapi") {
+                println!("cargo:rustc-link-lib=va");
+                println!("cargo:rustc-link-lib=va-drm");
             }
         }
         "macos" => {

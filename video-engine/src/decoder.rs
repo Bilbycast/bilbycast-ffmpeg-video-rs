@@ -18,15 +18,20 @@ use video_codec::{VideoCodec, VideoError};
 /// Decoder backend — selects which FFmpeg decoder family `VideoDecoder`
 /// opens against. `Cpu` is the always-available libavcodec software
 /// path; the hardware variants need their corresponding Cargo features
-/// (`video-decoder-nvdec`, `video-decoder-qsv`) AND a working driver +
-/// hardware at runtime — open will return `EncoderDisabled` /
-/// `OpenCodec` when the host can't satisfy the request.
+/// (`video-decoder-nvdec`, `video-decoder-qsv`, `video-decoder-vaapi`)
+/// AND a working driver + hardware at runtime — open will return
+/// `EncoderDisabled` / `OpenCodec` when the host can't satisfy the
+/// request.
 ///
 /// HW frames come back in NV12 system memory by default — the cuvid /
 /// QSV decoders auto-download to host memory via FFmpeg's built-in
 /// hwframe transfer. Callers pick up the layout via
 /// [`DecodedFrame::pixel_format`] and either use [`DecodedFrame::yuv_planes`]
 /// (planar YUV) or [`DecodedFrame::nv12_planes`] (semi-planar NV12).
+///
+/// `Vaapi` is wired through the build system today but has no runtime
+/// implementation yet — opening it returns a clear "not implemented"
+/// error pending the `AVHWDeviceContext` plumbing in `video-engine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
     /// libavcodec software decoder. Always available.
@@ -37,6 +42,9 @@ pub enum DecoderBackend {
     /// Intel QuickSync via `h264_qsv` / `hevc_qsv`. Needs the
     /// `video-decoder-qsv` Cargo feature.
     Qsv,
+    /// VAAPI via `h264_vaapi` / `hevc_vaapi`. Needs the
+    /// `video-decoder-vaapi` Cargo feature. Linux only.
+    Vaapi,
 }
 
 impl DecoderBackend {
@@ -51,6 +59,8 @@ impl DecoderBackend {
             (DecoderBackend::Nvdec, VideoCodec::Hevc) => Some("hevc_cuvid"),
             (DecoderBackend::Qsv, VideoCodec::H264) => Some("h264_qsv"),
             (DecoderBackend::Qsv, VideoCodec::Hevc) => Some("hevc_qsv"),
+            (DecoderBackend::Vaapi, VideoCodec::H264) => Some("h264_vaapi"),
+            (DecoderBackend::Vaapi, VideoCodec::Hevc) => Some("hevc_vaapi"),
         }
     }
 }
@@ -101,6 +111,24 @@ impl DecodedFrame {
     /// default).
     pub fn is_full_range(&self) -> bool {
         unsafe { (*self.frame).color_range == 2 }
+    }
+
+    /// `AVColorTransferCharacteristic` (`AVCOL_TRC_*`). Drives the
+    /// EOTF — `AVCOL_TRC_BT709` (1) for SDR HD, `AVCOL_TRC_SMPTE2084`
+    /// (16) for PQ HDR, `AVCOL_TRC_ARIB_STD_B67` (18) for HLG HDR,
+    /// `AVCOL_TRC_UNSPECIFIED` (2) when the bitstream didn't tell us.
+    /// Confidence-monitor consumers (display output) read this to
+    /// decide whether to apply an HDR-to-SDR tonemap before blitting.
+    pub fn color_transfer(&self) -> i32 {
+        unsafe { (*self.frame).color_trc as i32 }
+    }
+
+    /// `AVColorPrimaries` (`AVCOL_PRI_*`). Drives the gamut conversion
+    /// — `AVCOL_PRI_BT709` (1), `AVCOL_PRI_BT2020` (9), etc. Plumbed
+    /// through alongside `color_transfer()` so the display output knows
+    /// when a UHD source needs BT.2020 → BT.709 awareness as well.
+    pub fn color_primaries(&self) -> i32 {
+        unsafe { (*self.frame).color_primaries as i32 }
     }
 
     /// Whether this frame is a keyframe.
@@ -201,16 +229,15 @@ impl DecodedFrame {
     /// Access the two planes of an NV12 frame (Y + interleaved UV).
     ///
     /// Returns `Some((y, y_stride, uv, uv_stride))` when the pixel
-    /// format is `AV_PIX_FMT_NV12` — the default system-memory output
-    /// of `h264_cuvid` / `hevc_cuvid` / `h264_qsv` / `hevc_qsv`. The UV
-    /// plane is half-height (4:2:0 chroma sub-sampling) and contains
-    /// interleaved U/V byte pairs at full chroma width — i.e. one CbCr
-    /// pair per 2×2 luma block.
+    /// format is `AV_PIX_FMT_NV12` — the default 8-bit system-memory
+    /// output of `h264_cuvid` / `hevc_cuvid` / `h264_qsv` / `hevc_qsv`.
+    /// The UV plane is half-height (4:2:0 chroma sub-sampling) and
+    /// contains interleaved U/V byte pairs at full chroma width — i.e.
+    /// one CbCr pair per 2×2 luma block.
     ///
-    /// Returns `None` for any other format. Callers in the display
-    /// path use this accessor when [`pixel_format`] reports NV12 and
-    /// fall back to [`yuv_planes`] for planar YUV (the CPU decoder
-    /// path).
+    /// Returns `None` for any other format. For the 10/12-bit semi-
+    /// planar siblings (`P010LE` / `P016LE`, the default cuvid / QSV
+    /// output for HEVC Main10 / Main12) use [`p01x_planes`].
     pub fn nv12_planes(&self) -> Option<(&[u8], usize, &[u8], usize)> {
         unsafe {
             let frame = &*self.frame;
@@ -233,6 +260,138 @@ impl DecodedFrame {
                 y_stride,
                 std::slice::from_raw_parts(uv_ptr, uv_stride * chroma_rows),
                 uv_stride,
+            ))
+        }
+    }
+
+    /// Access the two planes of a P010LE / P016LE frame (Y + interleaved
+    /// UV with a 16-bit LE container per sample, 10 / 12 valid bits in
+    /// the high bits). Default system-memory output of `hevc_cuvid` /
+    /// `hevc_qsv` for HEVC Main10 / Main12 sources.
+    ///
+    /// Returns `Some((y, y_stride, uv, uv_stride, planar_pix_fmt))` —
+    /// the same shape as [`nv12_planes`] plus the libavcodec
+    /// `AVPixelFormat` enum value of the matching 3-plane planar
+    /// destination (`YUV420P10LE` for P010LE, `YUV420P12LE` for P016LE).
+    /// Callers deinterleave the UV plane into separate U / V planes
+    /// (each carrying the 2-byte-per-sample LE layout verbatim) and
+    /// stamp `planar_pix_fmt` on the outgoing frame so the downstream
+    /// libswscale-backed scaler interprets the bit depth correctly.
+    ///
+    /// Strides are bytes (libavcodec convention), not samples — slice
+    /// math is identical to the 8-bit path; only the call-site
+    /// deinterleave needs to copy 2 bytes per sample instead of 1.
+    ///
+    /// Returns `None` for any other format.
+    pub fn p01x_planes(&self) -> Option<(&[u8], usize, &[u8], usize, i32)> {
+        unsafe {
+            let frame = &*self.frame;
+            let planar_pix_fmt = if frame.format == AVPixelFormat_AV_PIX_FMT_P010LE {
+                AVPixelFormat_AV_PIX_FMT_YUV420P10LE
+            } else if frame.format == AVPixelFormat_AV_PIX_FMT_P016LE {
+                AVPixelFormat_AV_PIX_FMT_YUV420P12LE
+            } else {
+                return None;
+            };
+            let y_ptr = frame.data[0];
+            let uv_ptr = frame.data[1];
+            if y_ptr.is_null() || uv_ptr.is_null() {
+                return None;
+            }
+            let y_stride = frame.linesize[0] as usize;
+            let uv_stride = frame.linesize[1] as usize;
+            let h = frame.height as usize;
+            let chroma_rows = (h + 1) >> 1;
+            Some((
+                std::slice::from_raw_parts(y_ptr, y_stride * h),
+                y_stride,
+                std::slice::from_raw_parts(uv_ptr, uv_stride * chroma_rows),
+                uv_stride,
+                planar_pix_fmt,
+            ))
+        }
+    }
+
+    /// Access the two planes of an NV16 (8-bit semi-planar 4:2:2) frame.
+    ///
+    /// Returns `Some((y, y_stride, uv, uv_stride))` when the pixel
+    /// format is `AV_PIX_FMT_NV16` — the 8-bit 4:2:2 sibling of NV12,
+    /// produced by NVDEC / QSV / VAAPI for 4:2:2 sources (e.g. AVC
+    /// 4:2:2 or HEVC 4:2:2 contribution feeds — broadcast contribution
+    /// frequently runs 4:2:2 to preserve chroma fidelity through
+    /// successive transcodes). The UV plane is **full-height** (no
+    /// vertical sub-sampling) and contains interleaved U/V byte pairs
+    /// at half luma width — i.e. one CbCr pair per 2×1 luma block.
+    ///
+    /// Returns `None` for any other format. For the 10/12-bit
+    /// semi-planar siblings (`P210LE` / `P216LE`) use [`p21x_planes`].
+    pub fn nv16_planes(&self) -> Option<(&[u8], usize, &[u8], usize)> {
+        unsafe {
+            let frame = &*self.frame;
+            if frame.format != AVPixelFormat_AV_PIX_FMT_NV16 {
+                return None;
+            }
+            let y_ptr = frame.data[0];
+            let uv_ptr = frame.data[1];
+            if y_ptr.is_null() || uv_ptr.is_null() {
+                return None;
+            }
+            let y_stride = frame.linesize[0] as usize;
+            let uv_stride = frame.linesize[1] as usize;
+            let h = frame.height as usize;
+            // 4:2:2: chroma rows == luma rows.
+            Some((
+                std::slice::from_raw_parts(y_ptr, y_stride * h),
+                y_stride,
+                std::slice::from_raw_parts(uv_ptr, uv_stride * h),
+                uv_stride,
+            ))
+        }
+    }
+
+    /// Access the two planes of a P210LE / P216LE (10/12-bit semi-planar
+    /// 4:2:2) frame.
+    ///
+    /// Returns `Some((y, y_stride, uv, uv_stride, planar_pix_fmt))` —
+    /// the 4:2:2 sibling of [`p01x_planes`]. P210LE keeps the 10 valid
+    /// bits at positions 6..15 of each 16-bit LE container; P216LE
+    /// keeps the 12 valid bits at positions 4..15. The matching planar
+    /// destination is `YUV422P10LE` / `YUV422P12LE` respectively (data
+    /// in the LOW bits) — callers must shift each sample down by 6 / 4
+    /// bits during deinterleave, exactly as the 4:2:0 P010 / P016 path
+    /// does.
+    ///
+    /// The chroma plane is **full-height** (4:2:2 has no vertical
+    /// sub-sampling) and contains interleaved U/V 16-bit-LE pairs at
+    /// half luma width.
+    ///
+    /// Produced by NVDEC / QSV / VAAPI for HEVC 4:2:2 10-bit / 12-bit
+    /// sources — the typical HEVC contribution profile in modern UHD
+    /// broadcast.
+    pub fn p21x_planes(&self) -> Option<(&[u8], usize, &[u8], usize, i32)> {
+        unsafe {
+            let frame = &*self.frame;
+            let planar_pix_fmt = if frame.format == AVPixelFormat_AV_PIX_FMT_P210LE {
+                AVPixelFormat_AV_PIX_FMT_YUV422P10LE
+            } else if frame.format == AVPixelFormat_AV_PIX_FMT_P216LE {
+                AVPixelFormat_AV_PIX_FMT_YUV422P12LE
+            } else {
+                return None;
+            };
+            let y_ptr = frame.data[0];
+            let uv_ptr = frame.data[1];
+            if y_ptr.is_null() || uv_ptr.is_null() {
+                return None;
+            }
+            let y_stride = frame.linesize[0] as usize;
+            let uv_stride = frame.linesize[1] as usize;
+            let h = frame.height as usize;
+            Some((
+                std::slice::from_raw_parts(y_ptr, y_stride * h),
+                y_stride,
+                std::slice::from_raw_parts(uv_ptr, uv_stride * h),
+                uv_stride,
+                planar_pix_fmt,
             ))
         }
     }
@@ -342,12 +501,16 @@ impl VideoDecoder {
                     };
                     avcodec_find_decoder(codec_id)
                 }
-                DecoderBackend::Nvdec | DecoderBackend::Qsv => {
+                DecoderBackend::Nvdec | DecoderBackend::Qsv | DecoderBackend::Vaapi => {
                     // HW backends are name-keyed (`h264_cuvid`, `hevc_qsv`,
-                    // ...). Look up the name; non-NULL result means the
-                    // matching `--enable-decoder=*` was passed to FFmpeg
-                    // configure, which corresponds to the Cargo feature
-                    // being on.
+                    // `h264_vaapi`, ...). Look up the name; non-NULL result
+                    // means the matching `--enable-decoder=*` was passed to
+                    // FFmpeg configure, which corresponds to the Cargo
+                    // feature being on. NB: VAAPI decode additionally needs
+                    // an `AVHWDeviceContext` set on the context before
+                    // `avcodec_open2` — that wiring lands in a follow-up
+                    // session; until then `avcodec_open2` will fail with
+                    // EINVAL when the operator tries to use VAAPI.
                     let Some(name) = backend.ffmpeg_decoder_name(codec) else {
                         return Err(VideoError::CodecNotFound(codec));
                     };
@@ -584,6 +747,141 @@ mod tests {
         }
     }
 
+    /// Construct a `DecodedFrame` from a synthetic AVFrame for unit
+    /// testing the plane accessors. The frame owns its own buffers via
+    /// `av_frame_get_buffer`, so `Drop` cleans up cleanly.
+    unsafe fn synthetic_frame(format: i32, width: i32, height: i32) -> DecodedFrame {
+        let frame = av_frame_alloc();
+        assert!(!frame.is_null(), "av_frame_alloc failed");
+        (*frame).format = format;
+        (*frame).width = width;
+        (*frame).height = height;
+        // 32-byte alignment matches FFmpeg's default and is wide enough
+        // for the AVX paths exercised by sws_scale on real frames.
+        let ret = av_frame_get_buffer(frame, 32);
+        assert_eq!(ret, 0, "av_frame_get_buffer failed: {ret}");
+        DecodedFrame { frame }
+    }
+
+    #[test]
+    fn p01x_planes_returns_yuv420p10le_for_p010le() {
+        init();
+        unsafe {
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P010LE, 16, 8);
+            let (y, ys, uv, uvs, planar_pix_fmt) =
+                frame.p01x_planes().expect("P010LE should be recognised");
+            assert_eq!(planar_pix_fmt, AVPixelFormat_AV_PIX_FMT_YUV420P10LE);
+            assert_eq!(y.len(), ys * 8);
+            // 4:2:0 chroma rows: half of luma height (rounded up).
+            assert_eq!(uv.len(), uvs * 4);
+            // Strides are bytes; 16-px-wide P010 has at least 32 bytes
+            // per luma row and 32 bytes per chroma row (one CbCr pair
+            // per 2×2 luma block, 2 bytes per sample).
+            assert!(ys >= 32, "y_stride {ys} unexpectedly small");
+            assert!(uvs >= 32, "uv_stride {uvs} unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn p01x_planes_returns_yuv420p12le_for_p016le() {
+        init();
+        unsafe {
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P016LE, 16, 8);
+            let (_, _, _, _, planar_pix_fmt) =
+                frame.p01x_planes().expect("P016LE should be recognised");
+            assert_eq!(planar_pix_fmt, AVPixelFormat_AV_PIX_FMT_YUV420P12LE);
+        }
+    }
+
+    #[test]
+    fn p01x_planes_returns_none_for_nv12() {
+        init();
+        unsafe {
+            // 8-bit NV12 is the nv12_planes() domain — the 10/12-bit
+            // accessor must reject it cleanly so the call-site dispatch
+            // chain falls through to the right branch.
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_NV12, 16, 8);
+            assert!(frame.p01x_planes().is_none());
+        }
+    }
+
+    #[test]
+    fn p01x_planes_returns_none_for_yuv420p() {
+        init();
+        unsafe {
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_YUV420P, 16, 8);
+            assert!(frame.p01x_planes().is_none());
+        }
+    }
+
+    #[test]
+    fn nv16_planes_returns_full_height_chroma() {
+        init();
+        unsafe {
+            let h = 8;
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_NV16, 16, h as i32);
+            let (y, ys, uv, uvs) = frame.nv16_planes().expect("NV16 should be recognised");
+            assert_eq!(y.len(), ys * h);
+            // 4:2:2: chroma plane height == luma height.
+            assert_eq!(uv.len(), uvs * h);
+            // Strides are bytes; 16-px-wide NV16 = 16 B/luma-row,
+            // chroma row carries 8 CbCr pairs = 16 B.
+            assert!(ys >= 16, "y_stride {ys} unexpectedly small");
+            assert!(uvs >= 16, "uv_stride {uvs} unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn nv16_planes_returns_none_for_nv12() {
+        init();
+        unsafe {
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_NV12, 16, 8);
+            assert!(frame.nv16_planes().is_none());
+        }
+    }
+
+    #[test]
+    fn p21x_planes_returns_yuv422p10le_for_p210le() {
+        init();
+        unsafe {
+            let h = 8;
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P210LE, 16, h as i32);
+            let (y, ys, uv, uvs, planar_pix_fmt) =
+                frame.p21x_planes().expect("P210LE should be recognised");
+            assert_eq!(planar_pix_fmt, AVPixelFormat_AV_PIX_FMT_YUV422P10LE);
+            assert_eq!(y.len(), ys * h);
+            // Full-height chroma.
+            assert_eq!(uv.len(), uvs * h);
+            // 16-px-wide P210 = 32 B/luma-row, 32 B/chroma-row (8 CbCr
+            // pairs × 2 bytes per sample × 2 samples per pair).
+            assert!(ys >= 32, "y_stride {ys} unexpectedly small");
+            assert!(uvs >= 32, "uv_stride {uvs} unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn p21x_planes_returns_yuv422p12le_for_p216le() {
+        init();
+        unsafe {
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P216LE, 16, 8);
+            let (_, _, _, _, planar_pix_fmt) =
+                frame.p21x_planes().expect("P216LE should be recognised");
+            assert_eq!(planar_pix_fmt, AVPixelFormat_AV_PIX_FMT_YUV422P12LE);
+        }
+    }
+
+    #[test]
+    fn p21x_planes_returns_none_for_p010le() {
+        init();
+        unsafe {
+            // 4:2:0 P010 is the p01x_planes() domain — the 4:2:2
+            // accessor must reject it so the call-site dispatch falls
+            // through to the right branch.
+            let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P010LE, 16, 8);
+            assert!(frame.p21x_planes().is_none());
+        }
+    }
+
     #[test]
     fn ffmpeg_decoder_name_mapping() {
         assert_eq!(
@@ -605,6 +903,14 @@ mod tests {
         assert_eq!(
             DecoderBackend::Qsv.ffmpeg_decoder_name(VideoCodec::Hevc),
             Some("hevc_qsv")
+        );
+        assert_eq!(
+            DecoderBackend::Vaapi.ffmpeg_decoder_name(VideoCodec::H264),
+            Some("h264_vaapi")
+        );
+        assert_eq!(
+            DecoderBackend::Vaapi.ffmpeg_decoder_name(VideoCodec::Hevc),
+            Some("hevc_vaapi")
         );
     }
 }

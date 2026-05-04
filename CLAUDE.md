@@ -33,6 +33,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 | **HEVC video encode (libx265)** | Opt-in via `video-encoder-x265` feature (GPL v2+) |
 | **NVENC H.264 / HEVC encode** | Opt-in via `video-encoder-nvenc` feature (LGPL-clean, NVIDIA GPU required at runtime) |
 | **QSV H.264 / HEVC encode (Intel oneVPL)** | Opt-in via `video-encoder-qsv` feature (LGPL-clean, x86_64 only, Intel iGPU + media driver required at runtime) |
+| **VAAPI H.264 / HEVC encode + decode** | Opt-in via `video-encoder-vaapi` / `video-decoder-vaapi` features (LGPL-clean via libva, Linux only). Build wires the FFmpeg `--enable-vaapi` flag and the `h264_vaapi` / `hevc_vaapi` codecs. **Today only the build wiring is in place** — the `AVHWDeviceContext` + `hw_frames_ctx` plumbing in `video-engine` lands in a follow-up; opening a VAAPI codec currently returns a "not yet implemented" error. |
 
 ## Build & Test
 
@@ -68,6 +69,12 @@ cargo build -p video-engine --features video-encoder-nvenc
 # newer; HEVC on Kaby Lake (7th gen) and newer.
 sudo apt install libvpl-dev
 cargo build -p video-engine --features video-encoder-qsv
+
+# VAAPI encode + decode (LGPL-clean via libva, Linux only). Primary
+# motivation is AMD-on-Linux (Mesa radeonsi). Also works on Intel iGPU
+# (iHD driver) but oneVPL/QSV exposes more rate-control knobs there.
+sudo apt install libva-dev
+cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 ```
 
 ### Prerequisites
@@ -82,6 +89,7 @@ cargo build -p video-engine --features video-encoder-qsv
   - `libx265-dev` when building with `video-encoder-x265` (GPL v2+)
   - `nv-codec-headers` when building with `video-encoder-nvenc` (royalty-free, NVIDIA driver required at runtime)
   - `libvpl-dev` when building with `video-encoder-qsv` (royalty-free, x86_64 only, Intel media driver + libvpl runtime required at runtime)
+  - `libva-dev` when building with `video-encoder-vaapi` / `video-decoder-vaapi` (royalty-free, Linux only, working VAAPI driver — Mesa radeonsi for AMD or iHD for Intel — required at runtime)
 
 ## Architecture
 

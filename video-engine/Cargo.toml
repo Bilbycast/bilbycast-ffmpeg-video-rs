@@ -15,6 +15,11 @@ video-encoder-x264 = ["libffmpeg-video-sys/video-encoder-x264"]
 video-encoder-x265 = ["libffmpeg-video-sys/video-encoder-x265"]
 video-encoder-nvenc = ["libffmpeg-video-sys/video-encoder-nvenc"]
 video-encoder-qsv = ["libffmpeg-video-sys/video-encoder-qsv"]
+# VAAPI encode (Linux-only). Pulls in `--enable-vaapi --enable-encoder=h264_vaapi`
+# / `hevc_vaapi` plus libva system-link directives. Needs `libva-dev`
+# at build time and a working VAAPI driver at runtime (Mesa radeonsi
+# for AMD, iHD for Intel). Primary motivation: AMD-on-Linux encode.
+video-encoder-vaapi = ["libffmpeg-video-sys/video-encoder-vaapi"]
 # Hardware-decode features — symmetric with the encoder set above. Each
 # enables compiled-in support for one HW decoder family in
 # `VideoDecoder::open_with_backend`. Off by default so generic builds
@@ -23,8 +28,11 @@ video-encoder-qsv = ["libffmpeg-video-sys/video-encoder-qsv"]
 #   NVIDIA driver at runtime.
 # - `video-decoder-qsv`:   libvpl-dev (same dep as QSV encode) + Intel
 #   media driver at runtime; x86_64 only.
+# - `video-decoder-vaapi`: libva-dev (same dep as VAAPI encode) +
+#   working VAAPI driver at runtime; Linux only.
 video-decoder-nvdec = ["libffmpeg-video-sys/video-decoder-nvdec"]
 video-decoder-qsv = ["libffmpeg-video-sys/video-decoder-qsv"]
+video-decoder-vaapi = ["libffmpeg-video-sys/video-decoder-vaapi"]
 
 [dependencies]
 libffmpeg-video-sys = { path = "../libffmpeg-video-sys" }

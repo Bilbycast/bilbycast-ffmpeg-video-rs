@@ -115,6 +115,23 @@ impl VideoEncoder {
                     return Err(VideoEncoderError::EncoderDisabled(config.codec));
                 }
             }
+            VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi => {
+                if !cfg!(feature = "video-encoder-vaapi") {
+                    return Err(VideoEncoderError::EncoderDisabled(config.codec));
+                }
+                // VAAPI encode additionally requires an
+                // `AVHWDeviceContext` set on the codec context plus a
+                // `hw_frames_ctx` describing the surface pool, neither
+                // of which is wrapped in `video-engine` yet. Surface a
+                // clear error pointing at the missing plumbing instead
+                // of letting `avcodec_open2` fall over with an opaque
+                // EINVAL at first frame.
+                return Err(VideoEncoderError::InvalidInput(
+                    "VAAPI encode is feature-gated but not yet wired through video-engine \
+                     (pending AVHWDeviceContext + hw_frames_ctx wrapping)"
+                        .into(),
+                ));
+            }
         }
 
         if config.width == 0 || config.height == 0 {

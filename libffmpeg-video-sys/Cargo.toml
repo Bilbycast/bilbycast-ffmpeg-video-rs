@@ -44,6 +44,21 @@ video-decoder-nvdec = []
 # media driver. NV12 system-memory output by default. x86_64-only.
 # Default off.
 video-decoder-qsv = []
+# Enable VAAPI hardware H.264/HEVC encoding via the FFmpeg `h264_vaapi`
+# / `hevc_vaapi` encoders. Linux-only (libva is a Linux-only API).
+# `libva-dev` + `libva-drm` at build time; a working VAAPI driver
+# (`mesa-va-drivers` for AMD radeonsi, `intel-media-va-driver-non-free`
+# for Intel iHD, `nvidia-vaapi-driver` for NVIDIA decode-only) at
+# runtime. Royalty-free at every layer (libva is MIT, FFmpeg's VAAPI
+# wrapper is LGPL). Primary motivation: AMD-on-Linux encode (the only
+# real path) and a future zero-copy display path. Default off.
+video-encoder-vaapi = []
+# Enable VAAPI hardware H.264/HEVC decoding via the FFmpeg `h264_vaapi`
+# / `hevc_vaapi` decoders. Same `libva-dev` build dependency as the
+# encoder. Linux-only. Decoded surfaces stay on the GPU when paired
+# with a VAAPI render path; otherwise FFmpeg downloads to NV12 system
+# memory like the cuvid / QSV decoders. Default off.
+video-decoder-vaapi = []
 
 [lib]
 doctest = false

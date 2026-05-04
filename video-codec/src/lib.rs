@@ -266,6 +266,9 @@ pub enum AudioError {
 /// - `H264Qsv` / `HevcQsv` require the `video-encoder-qsv` feature, an
 ///   Intel iGPU (or Arc dGPU), and the Intel media driver + libvpl
 ///   runtime on the host.
+/// - `H264Vaapi` / `HevcVaapi` require the `video-encoder-vaapi` feature
+///   and a working VAAPI driver (Mesa radeonsi on AMD, iHD on Intel) at
+///   runtime. Linux only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoEncoderCodec {
     /// libx264 → H.264 (Advanced Video Coding).
@@ -280,6 +283,10 @@ pub enum VideoEncoderCodec {
     H264Qsv,
     /// Intel QuickSync (oneVPL) HEVC hardware encoder.
     HevcQsv,
+    /// VAAPI H.264 hardware encoder (Linux; AMD/Intel via libva).
+    H264Vaapi,
+    /// VAAPI HEVC hardware encoder (Linux; AMD/Intel via libva).
+    HevcVaapi,
 }
 
 impl VideoEncoderCodec {
@@ -288,10 +295,12 @@ impl VideoEncoderCodec {
         match self {
             VideoEncoderCodec::X264
             | VideoEncoderCodec::H264Nvenc
-            | VideoEncoderCodec::H264Qsv => VideoCodec::H264,
+            | VideoEncoderCodec::H264Qsv
+            | VideoEncoderCodec::H264Vaapi => VideoCodec::H264,
             VideoEncoderCodec::X265
             | VideoEncoderCodec::HevcNvenc
-            | VideoEncoderCodec::HevcQsv => VideoCodec::Hevc,
+            | VideoEncoderCodec::HevcQsv
+            | VideoEncoderCodec::HevcVaapi => VideoCodec::Hevc,
         }
     }
 
@@ -304,6 +313,8 @@ impl VideoEncoderCodec {
             VideoEncoderCodec::HevcNvenc => "hevc_nvenc",
             VideoEncoderCodec::H264Qsv => "h264_qsv",
             VideoEncoderCodec::HevcQsv => "hevc_qsv",
+            VideoEncoderCodec::H264Vaapi => "h264_vaapi",
+            VideoEncoderCodec::HevcVaapi => "hevc_vaapi",
         }
     }
 }

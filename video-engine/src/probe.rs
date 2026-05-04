@@ -53,6 +53,13 @@ pub enum ProbeError {
     /// running user can't open `/dev/dri/renderD128`. Permission, not a
     /// missing-driver issue.
     PermissionDenied,
+    /// `avcodec_open2` succeeded but the decoder's advertised output
+    /// pixel formats contain only HW-surface formats (e.g. AV_PIX_FMT_VAAPI
+    /// alone for a VAAPI decoder without hwdevice context wiring) —
+    /// nothing the safe wrapper can drain through its `*_planes`
+    /// accessors. Keeps the cost-plan resolver from picking a backend
+    /// that opens cleanly but produces frames we can't read.
+    NoReadablePixelFormat,
     /// Any other FFmpeg error. Holds the raw negative errno / AVERROR.
     OpenFailed(i32),
 }
@@ -79,6 +86,7 @@ impl ProbeError {
             ProbeError::Busy => "busy",
             ProbeError::DriverMissing => "driver_missing",
             ProbeError::PermissionDenied => "permission_denied",
+            ProbeError::NoReadablePixelFormat => "no_readable_pixfmt",
             ProbeError::OpenFailed(_) => "open_failed",
         }
     }
@@ -94,6 +102,10 @@ impl std::fmt::Display for ProbeError {
             ProbeError::PermissionDenied => {
                 write!(f, "avcodec_open2 EACCES (check /dev/dri permissions)")
             }
+            ProbeError::NoReadablePixelFormat => write!(
+                f,
+                "decoder advertises only HW-surface pixel formats; nothing drainable"
+            ),
             ProbeError::OpenFailed(code) => write!(f, "avcodec_open2 failed (code {})", code),
         }
     }
@@ -416,6 +428,19 @@ unsafe fn try_open_encoder_context(
 /// `avcodec_open2`. Decoders auto-detect dimensions from the first
 /// packet, so we leave width/height at 0 — the open call only needs the
 /// codec descriptor + sane time_base.
+///
+/// After `avcodec_open2` succeeds we additionally walk the codec's
+/// advertised `pix_fmts` list and reject decoders whose only output
+/// formats are HW-surface formats we have no `*_planes` accessor for
+/// (`AV_PIX_FMT_VAAPI`, `AV_PIX_FMT_QSV`, `AV_PIX_FMT_CUDA`, ...).
+/// Rationale — `h264_vaapi` opens cleanly without an `AVHWDeviceContext`
+/// but produces only `AV_PIX_FMT_VAAPI` surfaces that the safe wrapper
+/// can't drain into system memory; the cost-plan resolver would then
+/// happily route a display output to a backend whose first frame
+/// silently disappears. Catching this at probe time is the cheap half
+/// of "is this backend actually usable end-to-end" — the runtime
+/// watchdog in bilbycast-edge's `output_display.rs` covers the
+/// "advertised format but driver lies" case.
 unsafe fn try_open_decoder_context(
     codec_ptr: *const AVCodec,
 ) -> Result<*mut AVCodecContext, ProbeError> {
@@ -435,7 +460,65 @@ unsafe fn try_open_decoder_context(
         avcodec_free_context(&mut c);
         return Err(ProbeError::from_avcodec_ret(ret));
     }
+
+    if !decoder_has_drainable_pix_fmt(codec_ptr) {
+        let mut c = ctx;
+        avcodec_free_context(&mut c);
+        return Err(ProbeError::NoReadablePixelFormat);
+    }
+
     Ok(ctx)
+}
+
+/// Walk a decoder's `pix_fmts` array (NULL-terminated by
+/// `AV_PIX_FMT_NONE = -1`) and return `true` if at least one entry is
+/// a system-memory layout the safe wrapper's `DecodedFrame::*_planes`
+/// accessors can drain. Decoders with a NULL `pix_fmts` list (no
+/// declared advertisement) are conservatively accepted — that includes
+/// most software decoders (`avcodec_find_decoder(H264)`), which always
+/// produce planar YUV.
+unsafe fn decoder_has_drainable_pix_fmt(codec_ptr: *const AVCodec) -> bool {
+    let mut p = (*codec_ptr).pix_fmts;
+    if p.is_null() {
+        // No advertisement → trust the runtime path to surface anything
+        // unreadable. Keeps us from rejecting SW decoders.
+        return true;
+    }
+    while *p != AVPixelFormat_AV_PIX_FMT_NONE {
+        if is_drainable_pix_fmt(*p) {
+            return true;
+        }
+        p = p.add(1);
+    }
+    false
+}
+
+/// Mirrors the dispatch chain in bilbycast-edge's `output_display.rs`
+/// `drain_video_frames`: every layout that has a working
+/// `DecodedFrame::*_planes` accessor is "drainable". Keep this list in
+/// lock-step with that file when adding new accessors.
+fn is_drainable_pix_fmt(fmt: AVPixelFormat) -> bool {
+    // bindgen names like `AVPixelFormat_AV_PIX_FMT_*` are non-upper-case
+    // by convention but stable, so use an if-guard chain rather than a
+    // match arm (which lints on each constant). One guard per accessor.
+    fmt == AVPixelFormat_AV_PIX_FMT_YUV420P
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV420P10LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV420P12LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV422P
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV422P10LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV422P12LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV444P
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV444P10LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUV444P12LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUVJ420P
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUVJ422P
+        || fmt == AVPixelFormat_AV_PIX_FMT_YUVJ444P
+        || fmt == AVPixelFormat_AV_PIX_FMT_NV12
+        || fmt == AVPixelFormat_AV_PIX_FMT_NV16
+        || fmt == AVPixelFormat_AV_PIX_FMT_P010LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_P016LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_P210LE
+        || fmt == AVPixelFormat_AV_PIX_FMT_P216LE
 }
 
 unsafe fn free_encoder_context(ctx: *mut AVCodecContext) {
@@ -507,5 +590,34 @@ mod tests {
         // libx264 is a software encoder — if compiled in, runtime open
         // must succeed regardless of host hardware.
         probe_open_encoder("libx264").expect("libx264 should open at runtime");
+    }
+
+    #[test]
+    fn drainable_pix_fmt_classifier_covers_planar_and_semiplanar() {
+        // Sample of the formats the safe wrapper's accessors handle —
+        // sanity check the classifier table stays in lock-step with
+        // `output_display.rs::drain_video_frames` so a future renamed
+        // pixel-format constant doesn't silently start rejecting probes.
+        for fmt in [
+            AVPixelFormat_AV_PIX_FMT_YUV420P,
+            AVPixelFormat_AV_PIX_FMT_YUV420P10LE,
+            AVPixelFormat_AV_PIX_FMT_YUV422P,
+            AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+            AVPixelFormat_AV_PIX_FMT_NV12,
+            AVPixelFormat_AV_PIX_FMT_NV16,
+            AVPixelFormat_AV_PIX_FMT_P010LE,
+            AVPixelFormat_AV_PIX_FMT_P210LE,
+        ] {
+            assert!(is_drainable_pix_fmt(fmt), "fmt {fmt} should be drainable");
+        }
+        // AV_PIX_FMT_NONE = -1 is the terminator sentinel; never
+        // drainable. AV_PIX_FMT_VAAPI = 53, AV_PIX_FMT_QSV = 165, and
+        // AV_PIX_FMT_CUDA = 119 are HW-surface formats that signal the
+        // decoder needs an `AVHWDeviceContext` we never wired — must
+        // not be classified as drainable.
+        assert!(!is_drainable_pix_fmt(AVPixelFormat_AV_PIX_FMT_NONE));
+        assert!(!is_drainable_pix_fmt(53));
+        assert!(!is_drainable_pix_fmt(165));
+        assert!(!is_drainable_pix_fmt(119));
     }
 }
