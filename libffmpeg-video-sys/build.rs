@@ -257,6 +257,14 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         // Video decoders
         "--enable-decoder=h264".into(),
         "--enable-decoder=hevc".into(),
+        // MPEG-2 video covers DVB-T / ATSC / legacy contribution. The
+        // libavcodec mpeg2video decoder also accepts MPEG-1 bitstreams,
+        // so a single decoder covers both stream_type=0x01 and 0x02.
+        "--enable-decoder=mpeg2video".into(),
+        // mpegvideo parser — needed so libavcodec correctly slices the
+        // raw ES we feed it into picture-aligned packets when the source
+        // stream lacks AU framing on PES boundaries.
+        "--enable-parser=mpegvideo".into(),
         // Video encoder (thumbnails)
         "--enable-encoder=mjpeg".into(),
         // Audio encoders

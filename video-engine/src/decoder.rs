@@ -57,10 +57,13 @@ impl DecoderBackend {
             (DecoderBackend::Cpu, _) => None,
             (DecoderBackend::Nvdec, VideoCodec::H264) => Some("h264_cuvid"),
             (DecoderBackend::Nvdec, VideoCodec::Hevc) => Some("hevc_cuvid"),
+            (DecoderBackend::Nvdec, VideoCodec::Mpeg2) => Some("mpeg2_cuvid"),
             (DecoderBackend::Qsv, VideoCodec::H264) => Some("h264_qsv"),
             (DecoderBackend::Qsv, VideoCodec::Hevc) => Some("hevc_qsv"),
+            (DecoderBackend::Qsv, VideoCodec::Mpeg2) => Some("mpeg2_qsv"),
             (DecoderBackend::Vaapi, VideoCodec::H264) => Some("h264_vaapi"),
             (DecoderBackend::Vaapi, VideoCodec::Hevc) => Some("hevc_vaapi"),
+            (DecoderBackend::Vaapi, VideoCodec::Mpeg2) => Some("mpeg2_vaapi"),
         }
     }
 }
@@ -498,6 +501,7 @@ impl VideoDecoder {
                     let codec_id = match codec {
                         VideoCodec::H264 => AVCodecID_AV_CODEC_ID_H264,
                         VideoCodec::Hevc => AVCodecID_AV_CODEC_ID_HEVC,
+                        VideoCodec::Mpeg2 => AVCodecID_AV_CODEC_ID_MPEG2VIDEO,
                     };
                     avcodec_find_decoder(codec_id)
                 }

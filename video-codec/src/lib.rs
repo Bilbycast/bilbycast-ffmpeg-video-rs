@@ -13,6 +13,10 @@ use thiserror::Error;
 pub enum VideoCodec {
     H264,
     Hevc,
+    /// MPEG-2 video (also covers MPEG-1 — the libavcodec `mpeg2video`
+    /// decoder accepts both since they share the same bitstream syntax
+    /// at the slice level).
+    Mpeg2,
 }
 
 impl VideoCodec {
@@ -21,12 +25,14 @@ impl VideoCodec {
         match self {
             VideoCodec::H264 => 0x1B,
             VideoCodec::Hevc => 0x24,
+            VideoCodec::Mpeg2 => 0x02,
         }
     }
 
     /// Try to identify codec from MPEG-TS stream type.
     pub fn from_stream_type(st: u8) -> Option<Self> {
         match st {
+            0x01 | 0x02 => Some(VideoCodec::Mpeg2),
             0x1B => Some(VideoCodec::H264),
             0x24 => Some(VideoCodec::Hevc),
             _ => None,
@@ -39,6 +45,7 @@ impl std::fmt::Display for VideoCodec {
         match self {
             VideoCodec::H264 => write!(f, "H.264"),
             VideoCodec::Hevc => write!(f, "H.265/HEVC"),
+            VideoCodec::Mpeg2 => write!(f, "MPEG-2 Video"),
         }
     }
 }

@@ -4,7 +4,7 @@
 
 Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for the bilbycast ecosystem. Provides safe, in-process media processing — replacing all ffmpeg subprocess dependencies in bilbycast-edge:
 
-- **Video decode:** H.264 / HEVC
+- **Video decode:** H.264 / HEVC / MPEG-1 / MPEG-2 (the libavcodec `mpeg2video` decoder accepts both MPEG-1 and MPEG-2 bitstreams)
 - **Video scale:** libswscale (currently only YUVJ420P output — see deferred items)
 - **Video encode:** MJPEG (thumbnails, always on) + **optional** libx264 / libx265 / NVENC via opt-in Cargo features
 - **Audio:** Opus, MP2, AC-3 encoding (AAC is handled by `bilbycast-fdk-aac-rs`)
@@ -23,6 +23,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 |---------|---------|
 | H.264 video decode | Yes |
 | HEVC/H.265 video decode | Yes |
+| MPEG-1 / MPEG-2 video decode | Yes (covers DVB-T / ATSC / legacy contribution) |
 | MJPEG encode | Yes (thumbnails) |
 | Frame scaling | Yes (Lanczos via libswscale) |
 | Black-screen detection | Yes (Y-plane luminance) |
@@ -96,8 +97,8 @@ cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 ### Video Decoder (`video-engine/src/decoder.rs`)
 
 `VideoDecoder` wraps FFmpeg's `AVCodecContext`:
-- `open(codec)` — create decoder for H.264 or HEVC
-- `send_packet(data)` — feed Annex B NAL unit data
+- `open(codec)` — create decoder for H.264, HEVC, or MPEG-1/2
+- `send_packet(data)` — feed Annex B NAL unit data (or MPEG-2 elementary stream verbatim)
 - `receive_frame()` → `DecodedFrame` with Y-plane access for luminance
 - `flush()` — reset decoder state
 
