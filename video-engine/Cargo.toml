@@ -1,9 +1,9 @@
 [package]
 name = "video-engine"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "Safe Rust wrapper around FFmpeg for video decode, scale, JPEG encode, and audio encode/decode (Opus/MP2/AC-3/E-AC-3)"
+description = "Safe Rust wrapper around FFmpeg for video decode, scale, JPEG encode, and audio encode/decode (Opus/MP2/AC-3/E-AC-3/AAC-LATM)"
 
 [features]
 default = []

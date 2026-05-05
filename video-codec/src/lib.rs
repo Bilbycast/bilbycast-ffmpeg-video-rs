@@ -142,7 +142,9 @@ impl std::fmt::Display for AudioCodecType {
 ///
 /// AAC variants stay on `bilbycast-fdk-aac-rs` (better quality + already
 /// in tree); this enum covers the non-AAC broadcast codecs the
-/// bilbycast-edge `display` output needs to render to ALSA.
+/// bilbycast-edge `display` output needs to render to ALSA, plus
+/// `AacLatm` for the LATM/LOAS-framed AAC carriage that fdk-aac's
+/// transport-layer parser doesn't unwrap on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDecoderCodec {
     /// MPEG-1 Layer II — UK / EU SD broadcast.
@@ -153,6 +155,12 @@ pub enum AudioDecoderCodec {
     Eac3,
     /// Opus — WebRTC and modern web ingest.
     Opus,
+    /// AAC carried over LATM/LOAS — `stream_type=0x11` in MPEG-TS,
+    /// common on Australian / Asian DVB-T broadcasts (e.g. Seven AU
+    /// program 1334) and some HE-AAC contribution feeds. Decoded via
+    /// libavcodec's `AAC_LATM` codec id; the splitter strips LOAS sync
+    /// (`0x2B7`) + 13-bit length frames.
+    AacLatm,
 }
 
 impl AudioDecoderCodec {
@@ -165,6 +173,7 @@ impl AudioDecoderCodec {
             Self::Ac3 => 0x81,
             Self::Eac3 => 0x87,
             Self::Opus => 0x06, // private_data — paired with Opus reg descriptor
+            Self::AacLatm => 0x11,
         }
     }
 }
@@ -176,6 +185,7 @@ impl std::fmt::Display for AudioDecoderCodec {
             Self::Ac3 => write!(f, "AC-3"),
             Self::Eac3 => write!(f, "E-AC-3"),
             Self::Opus => write!(f, "Opus"),
+            Self::AacLatm => write!(f, "AAC-LATM"),
         }
     }
 }

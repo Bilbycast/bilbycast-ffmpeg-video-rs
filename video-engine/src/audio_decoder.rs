@@ -97,6 +97,9 @@ impl AudioDecoder {
                         by_name
                     }
                 }
+                AudioDecoderCodec::AacLatm => {
+                    avcodec_find_decoder(AVCodecID_AV_CODEC_ID_AAC_LATM)
+                }
             };
             if codec_ptr.is_null() {
                 return Err(AudioError::DecoderNotFound(codec));

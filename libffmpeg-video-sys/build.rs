@@ -275,11 +275,17 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         // Audio decoders — feed the bilbycast-edge `display` output's
         // ALSA backend through the new video-engine `AudioDecoder`. AAC
         // stays on bilbycast-fdk-aac-rs (better quality, already in tree);
-        // these are the broadcast codecs FDK doesn't cover.
+        // these are the broadcast codecs FDK doesn't cover, plus the
+        // LATM/LOAS-framed AAC carriage common on Australian / Asian
+        // DVB-T (`stream_type=0x11`) which fdk-aac's transport layer
+        // doesn't unwrap — we feed libavcodec the LOAS frames after
+        // the bilbycast-edge LOAS splitter strips sync + length.
         "--enable-decoder=mp2".into(),
         "--enable-decoder=ac3".into(),
         "--enable-decoder=eac3".into(),
         "--enable-decoder=libopus".into(),
+        "--enable-decoder=aac_latm".into(),
+        "--enable-parser=aac_latm".into(),
         // Static only
         "--enable-static".into(),
         "--disable-shared".into(),
