@@ -23,16 +23,22 @@ pub mod encoder;
 pub mod probe;
 pub mod scaler;
 pub mod thumbnail;
+pub mod vaapi;
 pub mod video_encoder;
 
 pub use audio_decoder::{AudioDecoder, DecodedAudioFrame};
 pub use audio_encoder::AudioEncoder;
 pub use decoder::{DecodedFrame, DecoderBackend, VideoDecoder};
+pub use vaapi::{
+    allocate_hw_frames_ctx, map_vaapi_to_drm_prime, DrmPrimeFrame, DrmPrimeKeepalive,
+    DrmPrimePlane, VaapiDevice,
+};
 pub use video_codec::{ScalerDstFormat, VideoCodec};
 pub use encoder::JpegEncoder;
 pub use probe::{
-    count_max_decoder_sessions, count_max_encoder_sessions, is_decoder_available,
-    is_encoder_available, probe_open_decoder, probe_open_encoder, probe_open_encoder_chroma,
+    count_max_decoder_sessions, count_max_encoder_sessions, count_max_vaapi_encoder_sessions,
+    is_decoder_available, is_encoder_available, probe_open_decoder, probe_open_encoder,
+    probe_open_encoder_chroma, probe_open_vaapi_encoder, probe_open_vaapi_encoder_chroma,
     ProbeChroma, ProbeError,
 };
 pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};

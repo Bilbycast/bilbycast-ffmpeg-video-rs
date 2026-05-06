@@ -229,6 +229,144 @@ pub fn count_max_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
     }
 }
 
+/// VAAPI-aware encoder probe. Generic
+/// [`probe_open_encoder`](probe_open_encoder) doesn't work for
+/// `h264_vaapi` / `hevc_vaapi` because VAAPI encoders need an
+/// `AVHWDeviceContext` + `hw_frames_ctx` set on the codec context
+/// before `avcodec_open2`. This routes through the full
+/// `VideoEncoder::open()` path, which performs the hwdevice + frames-
+/// context setup. Returns the same [`ProbeError`] taxonomy as the
+/// generic helper.
+///
+/// Tests the 4:2:0 8-bit baseline. Use
+/// [`probe_open_vaapi_encoder_chroma`] to test other broadcast
+/// contribution combinations (4:2:2, 10-bit).
+///
+/// `name` must be `"h264_vaapi"` or `"hevc_vaapi"`. Other inputs return
+/// [`ProbeError::NotCompiled`].
+#[cfg(feature = "video-encoder-vaapi")]
+pub fn probe_open_vaapi_encoder(name: &str) -> Result<(), ProbeError> {
+    probe_open_vaapi_encoder_chroma(name, ProbeChroma::Yuv420_8bit)
+}
+
+#[cfg(not(feature = "video-encoder-vaapi"))]
+pub fn probe_open_vaapi_encoder(_name: &str) -> Result<(), ProbeError> {
+    Err(ProbeError::NotCompiled)
+}
+
+/// Like [`probe_open_vaapi_encoder`] but tests a specific (chroma,
+/// bit-depth) combination. Used by the bilbycast-edge hardware probe
+/// to populate the VAAPI cells of `HwEncoderChromaCapability` so the
+/// manager UI can gate the chroma/bit-depth dropdown.
+///
+/// Per-codec combinations rejected up front by the encoder
+/// (`h264_vaapi` outside 4:2:0 8-bit; any 4:4:4) return
+/// [`ProbeError::NotCompiled`] without burning a session slot.
+#[cfg(feature = "video-encoder-vaapi")]
+pub fn probe_open_vaapi_encoder_chroma(
+    name: &str,
+    chroma: ProbeChroma,
+) -> Result<(), ProbeError> {
+    use video_codec::{
+        VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoEncoderError,
+    };
+
+    let codec = match name {
+        "h264_vaapi" => VideoEncoderCodec::H264Vaapi,
+        "hevc_vaapi" => VideoEncoderCodec::HevcVaapi,
+        _ => return Err(ProbeError::NotCompiled),
+    };
+    let (cfg_chroma, cfg_bit_depth) = match chroma {
+        ProbeChroma::Yuv420_8bit => (VideoChroma::Yuv420, 8u8),
+        ProbeChroma::Yuv420_10bit => (VideoChroma::Yuv420, 10u8),
+        ProbeChroma::Yuv422_8bit => (VideoChroma::Yuv422, 8u8),
+        ProbeChroma::Yuv422_10bit => (VideoChroma::Yuv422, 10u8),
+    };
+    // Skip combinations the encoder explicitly rejects so we don't
+    // burn a VAAPI session slot on a known-unsupported open. H.264
+    // VAAPI is 4:2:0 8-bit only on every implementation.
+    if codec == VideoEncoderCodec::H264Vaapi
+        && (cfg_bit_depth != 8 || cfg_chroma != VideoChroma::Yuv420)
+    {
+        return Err(ProbeError::NotCompiled);
+    }
+    let cfg = VideoEncoderConfig {
+        codec,
+        width: PROBE_WIDTH as u32,
+        height: PROBE_HEIGHT as u32,
+        fps_num: PROBE_FPS_NUM as u32,
+        fps_den: 1,
+        bitrate_kbps: (PROBE_BITRATE / 1000) as u32,
+        gop_size: PROBE_GOP as u32,
+        max_b_frames: 0,
+        chroma: cfg_chroma,
+        bit_depth: cfg_bit_depth,
+        ..VideoEncoderConfig::default()
+    };
+    match crate::video_encoder::VideoEncoder::open(&cfg) {
+        Ok(_enc) => Ok(()),
+        Err(VideoEncoderError::EncoderDisabled(_) | VideoEncoderError::EncoderNotFound(_)) => {
+            Err(ProbeError::NotCompiled)
+        }
+        Err(VideoEncoderError::OpenCodec(code))
+        | Err(VideoEncoderError::AllocFrameBuffer(code))
+        | Err(VideoEncoderError::SendFrame(code)) => Err(ProbeError::from_avcodec_ret(code)),
+        Err(_) => Err(ProbeError::OpenFailed(-22)),
+    }
+}
+
+#[cfg(not(feature = "video-encoder-vaapi"))]
+pub fn probe_open_vaapi_encoder_chroma(
+    _name: &str,
+    _chroma: ProbeChroma,
+) -> Result<(), ProbeError> {
+    Err(ProbeError::NotCompiled)
+}
+
+/// VAAPI-aware encoder session-count probe. Counts the maximum number
+/// of concurrent `VideoEncoder::open()` calls that succeed, capped at
+/// `upper_bound`. AMD VCN (radeonsi) typically caps at 1–2 concurrent
+/// encode sessions per VCN engine; Intel iHD scales much higher. Holds
+/// every successfully-opened encoder until the loop ends, then drops
+/// them all (Drop releases the VAAPI surface pools + the codec context).
+#[cfg(feature = "video-encoder-vaapi")]
+pub fn count_max_vaapi_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig};
+
+    let codec = match name {
+        "h264_vaapi" => VideoEncoderCodec::H264Vaapi,
+        "hevc_vaapi" => VideoEncoderCodec::HevcVaapi,
+        _ => return 0,
+    };
+    let cfg = VideoEncoderConfig {
+        codec,
+        width: PROBE_WIDTH as u32,
+        height: PROBE_HEIGHT as u32,
+        fps_num: PROBE_FPS_NUM as u32,
+        fps_den: 1,
+        bitrate_kbps: (PROBE_BITRATE / 1000) as u32,
+        gop_size: PROBE_GOP as u32,
+        max_b_frames: 0,
+        ..VideoEncoderConfig::default()
+    };
+    let mut held: Vec<crate::video_encoder::VideoEncoder> =
+        Vec::with_capacity(upper_bound as usize);
+    for _ in 0..upper_bound {
+        match crate::video_encoder::VideoEncoder::open(&cfg) {
+            Ok(enc) => held.push(enc),
+            Err(_) => break,
+        }
+    }
+    let count = held.len() as u32;
+    drop(held);
+    count
+}
+
+#[cfg(not(feature = "video-encoder-vaapi"))]
+pub fn count_max_vaapi_encoder_sessions(_name: &str, _upper_bound: u32) -> u32 {
+    0
+}
+
 /// Decoder twin of [`count_max_encoder_sessions`].
 pub fn count_max_decoder_sessions(name: &str, upper_bound: u32) -> u32 {
     let cstr = match std::ffi::CString::new(name) {

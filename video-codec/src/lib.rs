@@ -671,4 +671,37 @@ pub enum VideoError {
     /// destination buffer too small for the configured output size).
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
+
+    /// `av_hwdevice_ctx_create` failed for the requested HW device type
+    /// (typical: VAAPI render node missing, driver not loaded, or running
+    /// user lacks `/dev/dri/renderD128` access). The negative integer is
+    /// the FFmpeg AVERROR.
+    #[error("failed to create HW device context: FFmpeg error {0}")]
+    HwDeviceCreate(i32),
+
+    /// `av_hwframe_ctx_alloc` / `_init` failed inside the `get_format`
+    /// callback or after first decoded frame.
+    #[error("failed to initialise HW frames context: FFmpeg error {0}")]
+    HwFramesInit(i32),
+
+    /// `av_hwframe_map` (e.g. VAAPI surface → DRM PRIME export) failed.
+    /// Common causes: source frame is not on the expected HW device,
+    /// destination format is unsupported, or the libva build doesn't
+    /// expose `vaExportSurfaceHandle` (libva < 1.1).
+    #[error("failed to map HW frame: FFmpeg error {0}")]
+    HwFrameMap(i32),
+
+    /// Caller asked for DRM PRIME mapping but the source frame isn't on
+    /// the VAAPI HW device (e.g. CPU-decoded frame, or the decoder
+    /// silently downloaded the surface to system memory).
+    #[error("HW frame not on VAAPI device — no DRM PRIME surface to map")]
+    HwFrameNotOnDevice,
+
+    /// The `get_format` callback ran but couldn't find `AV_PIX_FMT_VAAPI`
+    /// in the codec's advertised format list — typical of a vendored
+    /// FFmpeg without VAAPI compiled in for this codec, or the bitstream
+    /// profile being unsupported by the VAAPI driver (e.g. HEVC 4:2:2
+    /// 12-bit on iHD, which only supports 4:2:0/4:2:2 10-bit).
+    #[error("VAAPI pixel format not advertised by the decoder")]
+    HwFormatUnavailable,
 }

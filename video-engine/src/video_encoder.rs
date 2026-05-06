@@ -32,9 +32,22 @@ use video_codec::{
     VideoRateControl,
 };
 
+use crate::vaapi::VaapiDevice;
+
 /// Safe video encoder wrapping FFmpeg's AVCodecContext.
 pub struct VideoEncoder {
     ctx: *mut AVCodecContext,
+    /// Encoder-input AVFrame.
+    ///
+    /// * **SW backends** (libx264 / libx265 / NVENC / QSV): pre-allocated
+    ///   at open time with the negotiated `pix_fmt`; planes are copied in
+    ///   per `encode_frame` call.
+    /// * **VAAPI backend**: allocated empty at open time. Per call we
+    ///   `av_frame_unref` to release the prior surface (the encoder
+    ///   internally retains its own reference for any frames still
+    ///   in-flight in the reorder queue), then `av_hwframe_get_buffer`
+    ///   pulls a fresh VAAPI surface from `hw_frames_ref`'s pool, which
+    ///   `av_hwframe_transfer_data` populates from `sw_frame`.
     frame: *mut AVFrame,
     packet: *mut AVPacket,
     codec: VideoEncoderCodec,
@@ -50,6 +63,26 @@ pub struct VideoEncoder {
     /// its `AVFrame.pict_type = AV_PICTURE_TYPE_I` so the encoder emits an
     /// IDR for that frame. Cleared automatically once consumed.
     force_idr_next: bool,
+    /// VAAPI hwdevice for `H264Vaapi` / `HevcVaapi` opens; `None` for
+    /// every other backend. Held alongside the codec context so the
+    /// `AVHWDeviceContext` outlives any encoder-internal references.
+    /// Drop order: the `VideoEncoder`'s `ctx` field is dropped first
+    /// (declaration order), which unrefs `hw_device_ctx` and
+    /// `hw_frames_ctx`, then the `VaapiDevice` Arc here drops the last
+    /// owning ref to the `AVBufferRef`.
+    #[allow(dead_code)]
+    vaapi_device: Option<VaapiDevice>,
+    /// VAAPI `hw_frames_ctx` (`AVBufferRef*`). Null for non-VAAPI
+    /// backends. The codec context owns its own bumped reference via
+    /// the `hw_frames_ctx` field; this one keeps a parallel ref so we
+    /// can `av_hwframe_get_buffer` per encode call.
+    hw_frames_ref: *mut AVBufferRef,
+    /// Sysmem source `AVFrame` for the VAAPI upload path. Carries
+    /// NV12-packed Y + interleaved-UV data assembled per-call from the
+    /// caller's planar Y/U/V buffers, then handed to
+    /// `av_hwframe_transfer_data` to populate the VAAPI surface. Null
+    /// for non-VAAPI backends.
+    sw_frame: *mut AVFrame,
 }
 
 /// Resolve `(chroma, bit_depth)` to an FFmpeg `AVPixelFormat`. Returns
@@ -79,6 +112,27 @@ fn resolve_pix_fmt(
 /// Bytes per luma/chroma sample for a given bit depth (8 → 1, 10 → 2).
 fn bytes_per_sample(bit_depth: u8) -> usize {
     if bit_depth > 8 { 2 } else { 1 }
+}
+
+/// Pick the VAAPI surface layout (`hw_frames_ctx.sw_format`) for the
+/// caller's chroma + bit-depth. Restricted to the four broadcast
+/// contribution combinations the encoder accepts; 4:4:4 (NV24) and
+/// non-8/non-10 bit depths are rejected at the top of `open()` before
+/// we get here. Not feature-gated — the function body only references
+/// pixel-format constants the bindgen pass always exposes; the call
+/// sites in `open()` are reachable only when the VAAPI codec branch
+/// passed the feature gate, so non-VAAPI builds compile this as
+/// dead code.
+fn vaapi_sw_format_for(chroma: VideoChroma, bit_depth: u8) -> AVPixelFormat {
+    match (chroma, bit_depth) {
+        (VideoChroma::Yuv420, 8) => AVPixelFormat_AV_PIX_FMT_NV12,
+        (VideoChroma::Yuv420, 10) => AVPixelFormat_AV_PIX_FMT_P010LE,
+        (VideoChroma::Yuv422, 8) => AVPixelFormat_AV_PIX_FMT_NV16,
+        (VideoChroma::Yuv422, 10) => AVPixelFormat_AV_PIX_FMT_P210LE,
+        // Yuv444 + non-{8,10} bit depths are rejected at the top of
+        // `VideoEncoder::open()` so they never reach this function.
+        _ => AVPixelFormat_AV_PIX_FMT_NV12,
+    }
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -119,18 +173,46 @@ impl VideoEncoder {
                 if !cfg!(feature = "video-encoder-vaapi") {
                     return Err(VideoEncoderError::EncoderDisabled(config.codec));
                 }
-                // VAAPI encode additionally requires an
-                // `AVHWDeviceContext` set on the codec context plus a
-                // `hw_frames_ctx` describing the surface pool, neither
-                // of which is wrapped in `video-engine` yet. Surface a
-                // clear error pointing at the missing plumbing instead
-                // of letting `avcodec_open2` fall over with an opaque
-                // EINVAL at first frame.
-                return Err(VideoEncoderError::InvalidInput(
-                    "VAAPI encode is feature-gated but not yet wired through video-engine \
-                     (pending AVHWDeviceContext + hw_frames_ctx wrapping)"
-                        .into(),
-                ));
+                // VAAPI encoder supports the broadcast contribution
+                // matrix: 4:2:0 + 4:2:2, 8-bit + 10-bit. Mapping to
+                // VAAPI surface formats:
+                //
+                //   chroma × depth  → sw_format    HEVC profile
+                //   ──────────────────────────────────────────────
+                //   Yuv420 × 8      → NV12         Main
+                //   Yuv420 × 10     → P010LE       Main 10
+                //   Yuv422 × 8      → NV16         Main 4:2:2 (rare)
+                //   Yuv422 × 10     → P210LE       Main 4:2:2 10
+                //
+                // 4:4:4 (NV24) is staged for follow-up. Driver support
+                // varies — Intel iHD on Tiger Lake (11th gen) and newer
+                // covers HEVC 4:2:2 8/10-bit; AMD VCN HEVC encoder
+                // generally rejects 4:2:2 at `avcodec_open2` (broadcast
+                // contribution shops on AMD typically pick libx265 for
+                // 4:2:2). The host probe surfaces this per-(codec,
+                // chroma, bit-depth) so the manager UI can gate the
+                // dropdown accordingly.
+                if config.chroma == VideoChroma::Yuv444 {
+                    return Err(VideoEncoderError::InvalidInput(
+                        "VAAPI encode does not support chroma=yuv444p (NV24 packer staged for follow-up)".into(),
+                    ));
+                }
+                if config.bit_depth != 8 && config.bit_depth != 10 {
+                    return Err(VideoEncoderError::InvalidInput(format!(
+                        "VAAPI encode supports bit_depth=8 or 10 (got {}-bit)",
+                        config.bit_depth,
+                    )));
+                }
+                // H.264 has no Main10 / Main 4:2:2 profile in any
+                // VAAPI implementation. Reject early; otherwise
+                // `avcodec_open2` surfaces an opaque EINVAL.
+                if config.codec == VideoEncoderCodec::H264Vaapi
+                    && (config.bit_depth != 8 || config.chroma != VideoChroma::Yuv420)
+                {
+                    return Err(VideoEncoderError::InvalidInput(
+                        "h264_vaapi supports 4:2:0 8-bit only — use hevc_vaapi for 4:2:2 / 10-bit broadcast contribution".into(),
+                    ));
+                }
             }
         }
 
@@ -223,6 +305,78 @@ impl VideoEncoder {
             (*ctx).framerate.den = config.fps_den as i32;
             (*ctx).gop_size = config.gop_size as i32;
             (*ctx).max_b_frames = config.max_b_frames as i32;
+
+            // VAAPI: open the hwdevice + allocate encoder-side
+            // `hw_frames_ctx` BEFORE `avcodec_open2`. The decoder lazy-
+            // allocates its frames context inside `vaapi_get_format_callback`
+            // once it has parsed the first SPS; encoders have no equivalent
+            // negotiation hook, so the pool has to be ready before open.
+            //
+            // Override `pix_fmt` to the HW surface format — the underlying
+            // surface layout is carried by `hw_frames_ctx.sw_format` and
+            // chosen by `vaapi_sw_format_for(chroma)`:
+            //   • Yuv420 8-bit → NV12  (4:2:0 contribution baseline)
+            //   • Yuv422 8-bit → NV16  (4:2:2 broadcast contribution)
+            // The same NV-style upload packer (Y plane direct copy +
+            // U/V byte-interleaved into the chroma plane) handles both
+            // — the only thing that differs is the chroma plane row
+            // count, which `chroma_height()` already encodes.
+            let mut vaapi_device: Option<VaapiDevice> = None;
+            let mut hw_frames_ref: *mut AVBufferRef = std::ptr::null_mut();
+            let is_vaapi = matches!(
+                config.codec,
+                VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi
+            );
+            if is_vaapi {
+                (*ctx).pix_fmt = AVPixelFormat_AV_PIX_FMT_VAAPI;
+
+                let device = match VaapiDevice::open(None) {
+                    Ok(d) => d,
+                    Err(video_codec::VideoError::HwDeviceCreate(code)) => {
+                        let mut c = ctx;
+                        avcodec_free_context(&mut c);
+                        return Err(VideoEncoderError::OpenCodec(code));
+                    }
+                    Err(_) => {
+                        let mut c = ctx;
+                        avcodec_free_context(&mut c);
+                        return Err(VideoEncoderError::OpenCodec(-22)); // EINVAL
+                    }
+                };
+                (*ctx).hw_device_ctx = device.new_buffer_ref();
+
+                let sw_format = vaapi_sw_format_for(config.chroma, config.bit_depth);
+
+                // Pool size: encoder reorder window (`max_b_frames + 1`)
+                // + in-flight upload surface + a small headroom. VAAPI's
+                // surface pool is fixed-size; `av_hwframe_get_buffer`
+                // returns ENOMEM once the pool is exhausted.
+                let pool_size = (config.max_b_frames as i32 + 1).max(2) + 4;
+                let frames_ref = match crate::vaapi::allocate_hw_frames_ctx(
+                    &device,
+                    config.width as i32,
+                    config.height as i32,
+                    sw_format,
+                    pool_size,
+                ) {
+                    Ok(r) => r,
+                    Err(video_codec::VideoError::HwFramesInit(code)) => {
+                        let mut c = ctx;
+                        avcodec_free_context(&mut c);
+                        drop(device);
+                        return Err(VideoEncoderError::OpenCodec(code));
+                    }
+                    Err(_) => {
+                        let mut c = ctx;
+                        avcodec_free_context(&mut c);
+                        drop(device);
+                        return Err(VideoEncoderError::OpenCodec(-22)); // EINVAL
+                    }
+                };
+                (*ctx).hw_frames_ctx = av_buffer_ref(frames_ref);
+                hw_frames_ref = frames_ref;
+                vaapi_device = Some(device);
+            }
 
             // Rate control. `Crf` leaves bit_rate unset (the encoder uses
             // the CRF value instead). CBR clamps min=max=target. VBR/ABR
@@ -342,6 +496,10 @@ impl VideoEncoder {
             if ret < 0 {
                 let mut c = ctx;
                 avcodec_free_context(&mut c);
+                if !hw_frames_ref.is_null() {
+                    av_buffer_unref(&mut hw_frames_ref);
+                }
+                drop(vaapi_device);
                 return Err(VideoEncoderError::OpenCodec(ret));
             }
 
@@ -349,18 +507,72 @@ impl VideoEncoder {
             if frame.is_null() {
                 let mut c = ctx;
                 avcodec_free_context(&mut c);
+                if !hw_frames_ref.is_null() {
+                    av_buffer_unref(&mut hw_frames_ref);
+                }
+                drop(vaapi_device);
                 return Err(VideoEncoderError::AllocFrame);
             }
-            (*frame).width = (*ctx).width;
-            (*frame).height = (*ctx).height;
-            (*frame).format = (*ctx).pix_fmt;
-            let ret = av_frame_get_buffer(frame, 32);
-            if ret < 0 {
-                let mut f = frame;
-                let mut c = ctx;
-                av_frame_free(&mut f);
-                avcodec_free_context(&mut c);
-                return Err(VideoEncoderError::AllocFrameBuffer(ret));
+            // Sysmem source frame for the VAAPI upload path; null for SW.
+            let mut sw_frame: *mut AVFrame = std::ptr::null_mut();
+            if is_vaapi {
+                // Don't pre-allocate the encoder-input frame's buffer.
+                // Per `encode_frame` call we `av_frame_unref` to release
+                // the prior surface and `av_hwframe_get_buffer` to pull
+                // a fresh one from the pool.
+                (*frame).width = (*ctx).width;
+                (*frame).height = (*ctx).height;
+                (*frame).format = AVPixelFormat_AV_PIX_FMT_VAAPI;
+
+                // Sysmem source frame in NV12 layout — populated per
+                // call from the caller's planar Y/U/V then handed to
+                // `av_hwframe_transfer_data`.
+                let s = av_frame_alloc();
+                if s.is_null() {
+                    let mut f = frame;
+                    let mut c = ctx;
+                    av_frame_free(&mut f);
+                    avcodec_free_context(&mut c);
+                    if !hw_frames_ref.is_null() {
+                        av_buffer_unref(&mut hw_frames_ref);
+                    }
+                    drop(vaapi_device);
+                    return Err(VideoEncoderError::AllocFrame);
+                }
+                (*s).width = config.width as i32;
+                (*s).height = config.height as i32;
+                // Match the surface layout: NV12 / P010LE for 4:2:0,
+                // NV16 / P210LE for 4:2:2. `av_hwframe_transfer_data`
+                // requires the sysmem source's `format` to equal the
+                // VAAPI hw_frames_ctx `sw_format`.
+                (*s).format = vaapi_sw_format_for(config.chroma, config.bit_depth);
+                let ret = av_frame_get_buffer(s, 32);
+                if ret < 0 {
+                    let mut sf = s;
+                    let mut f = frame;
+                    let mut c = ctx;
+                    av_frame_free(&mut sf);
+                    av_frame_free(&mut f);
+                    avcodec_free_context(&mut c);
+                    if !hw_frames_ref.is_null() {
+                        av_buffer_unref(&mut hw_frames_ref);
+                    }
+                    drop(vaapi_device);
+                    return Err(VideoEncoderError::AllocFrameBuffer(ret));
+                }
+                sw_frame = s;
+            } else {
+                (*frame).width = (*ctx).width;
+                (*frame).height = (*ctx).height;
+                (*frame).format = (*ctx).pix_fmt;
+                let ret = av_frame_get_buffer(frame, 32);
+                if ret < 0 {
+                    let mut f = frame;
+                    let mut c = ctx;
+                    av_frame_free(&mut f);
+                    avcodec_free_context(&mut c);
+                    return Err(VideoEncoderError::AllocFrameBuffer(ret));
+                }
             }
 
             let packet = av_packet_alloc();
@@ -368,7 +580,15 @@ impl VideoEncoder {
                 let mut f = frame;
                 let mut c = ctx;
                 av_frame_free(&mut f);
+                if !sw_frame.is_null() {
+                    let mut sf = sw_frame;
+                    av_frame_free(&mut sf);
+                }
                 avcodec_free_context(&mut c);
+                if !hw_frames_ref.is_null() {
+                    av_buffer_unref(&mut hw_frames_ref);
+                }
+                drop(vaapi_device);
                 return Err(VideoEncoderError::AllocPacket);
             }
 
@@ -399,6 +619,9 @@ impl VideoEncoder {
                 frame_count: 0,
                 extradata,
                 force_idr_next: false,
+                vaapi_device,
+                hw_frames_ref,
+                sw_frame,
             })
         }
     }
@@ -501,31 +724,173 @@ impl VideoEncoder {
         }
 
         unsafe {
-            // Copy the caller's planes into the AVFrame buffers respecting
-            // the frame's internal linesize (which may differ from the
-            // caller's stride due to libavutil alignment).
-            copy_plane((*self.frame).data[0], (*self.frame).linesize[0], y, y_stride, h);
-            copy_plane((*self.frame).data[1], (*self.frame).linesize[1], u, u_stride, hh);
-            copy_plane((*self.frame).data[2], (*self.frame).linesize[2], v, v_stride, hh);
-
-            (*self.frame).pts = pts.unwrap_or(self.frame_count);
-            self.frame_count = (*self.frame).pts + 1;
-
-            // One-shot IDR request: libx264 / libx265 / NVENC all honour
-            // `pict_type = I` by emitting an IDR for that frame. Required
-            // for seamless input switching — the downstream decoder needs
-            // a keyframe on the first frame after a switch, regardless of
-            // where we are in the current GOP. Always reset to NONE on
-            // normal frames so the encoder's rate control stays in charge.
-            if self.force_idr_next {
-                (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
-                self.force_idr_next = false;
+            if self.is_vaapi() {
+                self.encode_frame_vaapi(y, y_stride, u, u_stride, v, v_stride, hh, ww, pts)
             } else {
-                (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+                self.encode_frame_sw(y, y_stride, u, u_stride, v, v_stride, hh, pts)
             }
-
-            self.send_and_receive()
         }
+    }
+
+    /// True when this encoder is opened against a VAAPI backend.
+    fn is_vaapi(&self) -> bool {
+        matches!(
+            self.codec,
+            VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi
+        )
+    }
+
+    /// SW encode path: copy three planar Y/U/V planes into the
+    /// pre-allocated `self.frame` buffer and send straight to the
+    /// encoder. Used by libx264 / libx265 / NVENC / QSV.
+    unsafe fn encode_frame_sw(
+        &mut self,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        u_stride: usize,
+        v: &[u8],
+        v_stride: usize,
+        hh: usize,
+        pts: Option<i64>,
+    ) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
+        let h = self.height as usize;
+        // Copy the caller's planes into the AVFrame buffers respecting
+        // the frame's internal linesize (which may differ from the
+        // caller's stride due to libavutil alignment).
+        copy_plane((*self.frame).data[0], (*self.frame).linesize[0], y, y_stride, h);
+        copy_plane((*self.frame).data[1], (*self.frame).linesize[1], u, u_stride, hh);
+        copy_plane((*self.frame).data[2], (*self.frame).linesize[2], v, v_stride, hh);
+
+        (*self.frame).pts = pts.unwrap_or(self.frame_count);
+        self.frame_count = (*self.frame).pts + 1;
+
+        // One-shot IDR request: libx264 / libx265 / NVENC all honour
+        // `pict_type = I` by emitting an IDR for that frame. Required
+        // for seamless input switching — the downstream decoder needs
+        // a keyframe on the first frame after a switch, regardless of
+        // where we are in the current GOP. Always reset to NONE on
+        // normal frames so the encoder's rate control stays in charge.
+        if self.force_idr_next {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
+            self.force_idr_next = false;
+        } else {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+        }
+
+        self.send_and_receive()
+    }
+
+    /// VAAPI encode path: pack the caller's planar YUV planes into the
+    /// sysmem `sw_frame` (NV12 / NV16 / P010LE / P210LE layout — Y
+    /// plane direct copy, U/V planes byte-interleaved into the chroma
+    /// plane), pull a fresh VAAPI surface from the pool via
+    /// `av_hwframe_get_buffer`, upload via `av_hwframe_transfer_data`,
+    /// and send the HW frame to the encoder. AMD VCN (radeonsi) and
+    /// Intel iHD both follow this pattern; the surface stays
+    /// GPU-resident through the encode.
+    ///
+    /// 8-bit and 10-bit paths differ only in the per-sample width and
+    /// (for 10-bit) the upper-10-bit shift libavutil's P010 / P210
+    /// formats expect — `YUV420P10LE` / `YUV422P10LE` source samples
+    /// store valid bits in the lower 10 of a 16-bit word, P010 / P210
+    /// surfaces expect them in the upper 10 (the lower 6 zeroed).
+    unsafe fn encode_frame_vaapi(
+        &mut self,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        u_stride: usize,
+        v: &[u8],
+        v_stride: usize,
+        hh: usize,
+        ww: usize,
+        pts: Option<i64>,
+    ) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
+        let h = self.height as usize;
+        let w = self.width as usize;
+
+        if self.bit_depth == 8 {
+            // 8-bit path: NV12 (4:2:0) or NV16 (4:2:2). Y plane is a
+            // direct byte copy; chroma plane interleaves U + V bytes.
+            // `hh` differentiates the two layouts: H/2 for 4:2:0,
+            // H for 4:2:2 (chroma_height varies; chroma_width is W/2
+            // for both).
+            copy_plane(
+                (*self.sw_frame).data[0],
+                (*self.sw_frame).linesize[0],
+                y,
+                y_stride,
+                h,
+            );
+            interleave_uv_8bit(
+                (*self.sw_frame).data[1],
+                (*self.sw_frame).linesize[1],
+                u,
+                u_stride,
+                v,
+                v_stride,
+                ww,
+                hh,
+            );
+        } else {
+            // 10-bit path: P010LE (4:2:0) or P210LE (4:2:2). Y plane
+            // is a 16-bit-per-sample copy with the low-10 → upper-10
+            // shift; chroma plane interleaves 16-bit U + V samples
+            // with the same shift.
+            copy_plane_10bit_lo_to_hi(
+                (*self.sw_frame).data[0],
+                (*self.sw_frame).linesize[0],
+                y,
+                y_stride,
+                h,
+                w,
+            );
+            interleave_uv_10bit_lo_to_hi(
+                (*self.sw_frame).data[1],
+                (*self.sw_frame).linesize[1],
+                u,
+                u_stride,
+                v,
+                v_stride,
+                ww,
+                hh,
+            );
+        }
+
+        let frame_pts = pts.unwrap_or(self.frame_count);
+        self.frame_count = frame_pts + 1;
+        (*self.sw_frame).pts = frame_pts;
+
+        // Release any prior VAAPI surface ref the encoder no longer
+        // needs (the encoder retains its own ref for in-flight frames),
+        // then pull a fresh surface from the hw_frames pool. ENOMEM
+        // here means the pool is exhausted — caller should reduce
+        // concurrent in-flight frames or increase pool_size at open.
+        av_frame_unref(self.frame);
+        let ret = av_hwframe_get_buffer(self.hw_frames_ref, self.frame, 0);
+        if ret < 0 {
+            return Err(VideoEncoderError::AllocFrameBuffer(ret));
+        }
+
+        // Upload sysmem NV12 → VAAPI surface. Format must match
+        // hw_frames_ctx.sw_format (set to NV12 at open time); FFmpeg
+        // returns EINVAL otherwise — `av_hwframe_transfer_data` does
+        // NOT do format conversion, so we packed NV12 explicitly above.
+        let ret = av_hwframe_transfer_data(self.frame, self.sw_frame, 0);
+        if ret < 0 {
+            return Err(VideoEncoderError::SendFrame(ret));
+        }
+
+        (*self.frame).pts = frame_pts;
+        if self.force_idr_next {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
+            self.force_idr_next = false;
+        } else {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+        }
+
+        self.send_and_receive()
     }
 
     /// Flush the encoder — drain any buffered frames at end of stream.
@@ -584,9 +949,20 @@ impl Drop for VideoEncoder {
             if !self.frame.is_null() {
                 av_frame_free(&mut self.frame);
             }
+            if !self.sw_frame.is_null() {
+                av_frame_free(&mut self.sw_frame);
+            }
             if !self.ctx.is_null() {
+                // `avcodec_free_context` unrefs `hw_device_ctx` and
+                // `hw_frames_ctx` that the codec owned; our parallel
+                // `hw_frames_ref` ref is released next.
                 avcodec_free_context(&mut self.ctx);
             }
+            if !self.hw_frames_ref.is_null() {
+                av_buffer_unref(&mut self.hw_frames_ref);
+            }
+            // `vaapi_device: Option<VaapiDevice>` drops here naturally,
+            // releasing the last AVHWDeviceContext ref.
         }
     }
 }
@@ -600,6 +976,106 @@ impl std::fmt::Debug for VideoEncoder {
             .field("fps_num", &self.fps_num)
             .field("fps_den", &self.fps_den)
             .finish()
+    }
+}
+
+/// Copy a 10-bit Y plane from `YUV420P10LE` / `YUV422P10LE` source
+/// (16-bit samples, valid bits in the LOWER 10) into a P010LE / P210LE
+/// destination (16-bit samples, valid bits in the UPPER 10) — i.e. one
+/// `u16 << 6` per sample.
+///
+/// `width_samples` is the luma plane width in samples (one sample = 2
+/// bytes both source and destination). The destination's `dst_stride`
+/// is in bytes — typically `width_samples * 2` plus libavutil
+/// alignment padding.
+///
+/// Per-sample throughput is the v1 implementation (no SIMD); broadcast
+/// 1080p30 at 10-bit is well under 100 MB/s and stays inside the
+/// `block_in_place` worker without touching the reactor.
+unsafe fn copy_plane_10bit_lo_to_hi(
+    dst: *mut u8,
+    dst_stride: i32,
+    src: &[u8],
+    src_stride: usize,
+    rows: usize,
+    width_samples: usize,
+) {
+    let dst_stride = dst_stride as usize;
+    for r in 0..rows {
+        let dst_row = dst.add(r * dst_stride) as *mut u16;
+        let src_row = src.as_ptr().add(r * src_stride) as *const u16;
+        for c in 0..width_samples {
+            let s = src_row.add(c).read_unaligned();
+            dst_row.add(c).write_unaligned(s << 6);
+        }
+    }
+}
+
+/// Pack two 10-bit chroma planes (`u`, `v` — `YUV420P10LE` /
+/// `YUV422P10LE` layout, valid bits in the LOWER 10 of a 16-bit word)
+/// into P010LE / P210LE chroma layout — `[U0, V0, U1, V1, …]`
+/// 16-bit-interleaved, with each sample shifted left by 6 to land its
+/// valid bits in the UPPER 10 bits as the P010 / P210 surface formats
+/// expect.
+///
+/// `width_chroma` is the chroma plane width in *samples* (luma width
+/// divided by 2 for both 4:2:0 and 4:2:2 — VAAPI's
+/// horizontal-subsampling shape). `rows` is the chroma plane height
+/// (`H/2` for 4:2:0, `H` for 4:2:2).
+unsafe fn interleave_uv_10bit_lo_to_hi(
+    dst: *mut u8,
+    dst_stride: i32,
+    u: &[u8],
+    u_stride: usize,
+    v: &[u8],
+    v_stride: usize,
+    width_chroma: usize,
+    rows: usize,
+) {
+    let dst_stride = dst_stride as usize;
+    for r in 0..rows {
+        let dst_row = dst.add(r * dst_stride) as *mut u16;
+        let u_row = u.as_ptr().add(r * u_stride) as *const u16;
+        let v_row = v.as_ptr().add(r * v_stride) as *const u16;
+        for c in 0..width_chroma {
+            let us = u_row.add(c).read_unaligned();
+            let vs = v_row.add(c).read_unaligned();
+            dst_row.add(c * 2).write_unaligned(us << 6);
+            dst_row.add(c * 2 + 1).write_unaligned(vs << 6);
+        }
+    }
+}
+
+/// Pack two single-byte planes (`u`, `v`) into NV12 / NV16 chroma
+/// layout — `[U0, V0, U1, V1, …]` byte-interleaved, one row at a time.
+///
+/// `dst` is the chroma plane (`AVFrame.data[1]`), `dst_stride` its
+/// linesize (typically `width` bytes — full luma width because U+V
+/// alternate at half width × 2 bytes-per-pair). `width_chroma` is the
+/// chroma plane width in samples (luma width / 2) and `rows` the
+/// chroma plane height (`H/2` for NV12 4:2:0, `H` for NV16 4:2:2).
+///
+/// 8-bit only — the 10-bit P010 / P210 path lives in
+/// [`interleave_uv_10bit_lo_to_hi`].
+unsafe fn interleave_uv_8bit(
+    dst: *mut u8,
+    dst_stride: i32,
+    u: &[u8],
+    u_stride: usize,
+    v: &[u8],
+    v_stride: usize,
+    width_chroma: usize,
+    rows: usize,
+) {
+    let dst_stride = dst_stride as usize;
+    for r in 0..rows {
+        let dst_row = dst.add(r * dst_stride);
+        let u_row = u.as_ptr().add(r * u_stride);
+        let v_row = v.as_ptr().add(r * v_stride);
+        for c in 0..width_chroma {
+            *dst_row.add(c * 2) = *u_row.add(c);
+            *dst_row.add(c * 2 + 1) = *v_row.add(c);
+        }
     }
 }
 

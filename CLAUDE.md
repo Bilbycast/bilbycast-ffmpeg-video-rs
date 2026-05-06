@@ -34,7 +34,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 | **HEVC video encode (libx265)** | Opt-in via `video-encoder-x265` feature (GPL v2+) |
 | **NVENC H.264 / HEVC encode** | Opt-in via `video-encoder-nvenc` feature (LGPL-clean, NVIDIA GPU required at runtime) |
 | **QSV H.264 / HEVC encode (Intel oneVPL)** | Opt-in via `video-encoder-qsv` feature (LGPL-clean, x86_64 only, Intel iGPU + media driver required at runtime) |
-| **VAAPI H.264 / HEVC encode + decode** | Opt-in via `video-encoder-vaapi` / `video-decoder-vaapi` features (LGPL-clean via libva, Linux only). Build wires the FFmpeg `--enable-vaapi` flag and the `h264_vaapi` / `hevc_vaapi` codecs. **Today only the build wiring is in place** — the `AVHWDeviceContext` + `hw_frames_ctx` plumbing in `video-engine` lands in a follow-up; opening a VAAPI codec currently returns a "not yet implemented" error. |
+| **VAAPI H.264 / HEVC encode + decode** | Opt-in via `video-encoder-vaapi` / `video-decoder-vaapi` features (LGPL-clean via libva, Linux only). Fully wired: `AVHWDeviceContext` + `hw_frames_ctx` setup in `video-engine/src/vaapi.rs`; encoder accepts the broadcast contribution matrix (4:2:0 + 4:2:2 × 8-bit + 10-bit, mapped to NV12 / NV16 / P010LE / P210LE surfaces — 4:4:4 / NV24 deferred); decoder exports DRM PRIME descriptors for zero-copy KMS scanout. h264_vaapi is 4:2:0 8-bit only by spec; HEVC covers the full broadcast matrix on Intel iHD (Tiger Lake+). AMD radeonsi typically rejects 4:2:2 at `avcodec_open2`. |
 
 ## Build & Test
 
@@ -118,18 +118,34 @@ cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 
 **Feature-gated.** `VideoEncoder` wraps FFmpeg's `AVCodecContext` for
 H.264 / HEVC compression:
-- `open(config)` — backend selected by `VideoEncoderCodec::X264 | X265 | H264Nvenc | HevcNvenc`.
+- `open(config)` — backend selected by `VideoEncoderCodec::{X264, X265, H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi}`.
   Returns `EncoderDisabled` when the matching Cargo feature was not enabled at build.
 - `encode_frame(y, y_stride, u, u_stride, v, v_stride, pts)` — accepts
-  planar YUV 4:2:0 (8-bit) planes with explicit strides. Returns zero
-  or more `EncodedVideoFrame` values with PTS / DTS / keyframe markers.
+  planar YUV 4:2:0 / 4:2:2 (8 + 10-bit) planes with explicit strides. Returns
+  zero or more `EncodedVideoFrame` values with PTS / DTS / keyframe markers.
 - `flush()` — drain trailing frames at end-of-stream.
 - `extradata()` — out-of-band SPS/PPS when `global_header = true`.
 
-**MVP limits** (see `bilbycast-edge/docs/transcoding.md`): no B-frames,
-no rate-control knobs beyond bitrate + `tune=zerolatency`, caller must
-already have the frame at the target resolution (scaler integration is
-pending).
+**Production controls** (`VideoEncoderConfig`): rate-control mode
+(VBR / CBR / CRF / ABR), CRF target, GOP size, B-frames, refs, preset,
+profile (auto / baseline / main / high / high10 / high422 / high444 / main10),
+chroma (4:2:0 / 4:2:2 / 4:4:4 — backend-validated), bit depth (8 / 10),
+tune, level, full colorimetry passthrough (primaries / transfer / matrix
+/ range — BT.709 / BT.2020 / PQ / HLG). `force_next_keyframe()` for
+input-switch IDR injection. Scaler integration in `bilbycast-edge`
+handles arbitrary input → target-resolution conversion before encode.
+
+**Backend pixel-format matrix** (rejection happens at `open()` so
+operators get a clear error, not opaque `avcodec_open2` EINVAL):
+
+| Backend | 4:2:0 / 8 | 4:2:2 / 8 | 4:2:0 / 10 | 4:2:2 / 10 | 4:4:4 |
+|---|:-:|:-:|:-:|:-:|:-:|
+| libx264 / libx265 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| h264_nvenc / h264_qsv | ✓ | ✗ | ✗ | ✗ | ✗ |
+| hevc_nvenc / hevc_qsv | ✓ | ✗ | ✓ | ✗ | ✗ |
+| h264_vaapi | ✓ | ✗ | ✗ | ✗ | ✗ |
+| hevc_vaapi (Intel iHD) | ✓ | ✓ | ✓ | ✓ | ✗ (NV24 deferred) |
+| hevc_vaapi (AMD radeonsi) | ✓ | usually ✗ | ✓ | usually ✗ | ✗ |
 
 ### Thumbnail (`video-engine/src/thumbnail.rs`)
 

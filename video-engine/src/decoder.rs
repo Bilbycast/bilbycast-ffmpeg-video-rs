@@ -15,6 +15,10 @@
 use libffmpeg_video_sys::*;
 use video_codec::{VideoCodec, VideoError};
 
+use crate::vaapi::{
+    map_vaapi_to_drm_prime, vaapi_get_format_callback, DrmPrimeFrame, VaapiDevice,
+};
+
 /// Decoder backend — selects which FFmpeg decoder family `VideoDecoder`
 /// opens against. `Cpu` is the always-available libavcodec software
 /// path; the hardware variants need their corresponding Cargo features
@@ -29,9 +33,14 @@ use video_codec::{VideoCodec, VideoError};
 /// [`DecodedFrame::pixel_format`] and either use [`DecodedFrame::yuv_planes`]
 /// (planar YUV) or [`DecodedFrame::nv12_planes`] (semi-planar NV12).
 ///
-/// `Vaapi` is wired through the build system today but has no runtime
-/// implementation yet — opening it returns a clear "not implemented"
-/// error pending the `AVHWDeviceContext` plumbing in `video-engine`.
+/// `Vaapi` opens the codec against an `AVHWDeviceContext` of type
+/// `AV_HWDEVICE_TYPE_VAAPI` (default render node `/dev/dri/renderD128`)
+/// and pins the negotiated pixel format to `AV_PIX_FMT_VAAPI` via a
+/// `get_format` callback. Decoded frames stay GPU-resident as VAAPI
+/// surfaces; call [`DecodedFrame::map_drm_prime`] to export one as a
+/// DMA-BUF descriptor for KMS scanout. The `*_planes` accessors return
+/// `None` for VAAPI frames — there's no system-memory pixel data to
+/// drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
     /// libavcodec software decoder. Always available.
@@ -420,6 +429,98 @@ impl DecodedFrame {
         }
     }
 
+    /// `true` when this is a VAAPI HW frame — `format == AV_PIX_FMT_VAAPI`
+    /// and `data[3]` holds an opaque `VASurfaceID`. The system-memory
+    /// plane accessors all return `None` for these; use
+    /// [`Self::map_drm_prime`] to export the surface as a DMA-BUF for
+    /// KMS scanout. Returns `false` for every other format (including
+    /// the SW-decoded planar / semi-planar layouts).
+    pub fn is_vaapi(&self) -> bool {
+        self.pixel_format() == AVPixelFormat_AV_PIX_FMT_VAAPI
+    }
+
+    /// Map a VAAPI HW surface to a DRM PRIME descriptor for zero-copy
+    /// KMS scanout. Returns the DMA-BUF fd, fourcc, modifier, dimensions
+    /// and per-plane offsets/strides plus an Arc-shared keepalive on the
+    /// underlying VAAPI frame — the caller hands the keepalive to the
+    /// page-flip loop and releases it only after the kernel posts
+    /// `DRM_EVENT_FLIP_COMPLETE`. Releasing earlier hands the surface
+    /// back to the VAAPI pool while it's still being scanned out, which
+    /// reads as tearing or a stuck frame on the HDMI output.
+    ///
+    /// Returns `Err(VideoError::HwFrameNotOnDevice)` when called on a
+    /// non-VAAPI frame; `Err(VideoError::HwFrameMap(_))` when the
+    /// libavutil DRM PRIME mapping path is unavailable (e.g. FFmpeg
+    /// built without `CONFIG_LIBDRM`) or the driver refused to export
+    /// this particular surface.
+    pub fn map_drm_prime(&self) -> Result<DrmPrimeFrame, VideoError> {
+        // SAFETY: `self.frame` is owned by `DecodedFrame` and lives at
+        // least until this method returns — `av_hwframe_map` clones the
+        // reference internally, so the resulting `DrmPrimeFrame` no
+        // longer depends on `self.frame` after this call.
+        unsafe { map_vaapi_to_drm_prime(self.frame as *const _) }
+    }
+
+    /// Download a VAAPI HW frame to system memory. Allocates a fresh
+    /// `AVFrame`, calls `av_hwframe_transfer_data` to copy the GPU
+    /// surface into sysmem (FFmpeg picks the best sysmem format —
+    /// NV12 for 8-bit YUV 4:2:0, P010LE for 10-bit), and returns a
+    /// new `DecodedFrame` whose `is_vaapi()` is `false` and whose
+    /// semi-planar accessors return `Some`. The caller's existing
+    /// SW-decoded codepath (libswscale + tonemap LUT etc.) then runs
+    /// unchanged.
+    ///
+    /// Use case: HDR sources on SDR panels via the local-display
+    /// output. The KMS zero-copy scanout path can't apply the PQ/HLG
+    /// → SDR tonemap LUT — only the CPU-blit + `apply_bgra` path
+    /// does. When the source's `color_transfer()` is
+    /// `AVCOL_TRC_SMPTE2084` (PQ) or `AVCOL_TRC_ARIB_STD_B67` (HLG)
+    /// we trade one PCIe download per frame for visually correct
+    /// output. On AMD radeonsi the VAAPI surface already lives in
+    /// system memory so the transfer is effectively a pointer alias;
+    /// on Intel iHD it's a real DMA.
+    ///
+    /// Returns `Err(VideoError::HwFrameNotOnDevice)` for non-VAAPI
+    /// frames, `Err(VideoError::AllocFrame)` on AVFrame alloc, and
+    /// `Err(VideoError::HwFrameMap(_))` when the transfer ioctl
+    /// failed (driver / format mismatch).
+    pub fn download_to_sysmem(&self) -> Result<DecodedFrame, VideoError> {
+        if !self.is_vaapi() {
+            return Err(VideoError::HwFrameNotOnDevice);
+        }
+        unsafe {
+            let dst = av_frame_alloc();
+            if dst.is_null() {
+                return Err(VideoError::AllocFrame);
+            }
+            // `format = AV_PIX_FMT_NONE` (-1) lets FFmpeg pick the
+            // best sysmem format the hwdevice exposes. VAAPI returns
+            // NV12 for 8-bit and P010LE for 10-bit surfaces.
+            (*dst).format = AVPixelFormat_AV_PIX_FMT_NONE;
+            let ret = av_hwframe_transfer_data(dst, self.frame, 0);
+            if ret < 0 {
+                let mut tmp = dst;
+                av_frame_free(&mut tmp);
+                return Err(VideoError::HwFrameMap(ret));
+            }
+            // `av_hwframe_transfer_data` populates dims + planes but
+            // doesn't carry timing / colorimetry metadata. The
+            // display task reads colorspace / range / transfer /
+            // primaries / pts straight off the `DecodedFrame`, so
+            // copy them across now — otherwise the downloaded frame
+            // would render with default Rec.709 + limited-range and
+            // the tonemap path wouldn't see the HDR transfer.
+            (*dst).pts = (*self.frame).pts;
+            (*dst).pkt_dts = (*self.frame).pkt_dts;
+            (*dst).colorspace = (*self.frame).colorspace;
+            (*dst).color_range = (*self.frame).color_range;
+            (*dst).color_trc = (*self.frame).color_trc;
+            (*dst).color_primaries = (*self.frame).color_primaries;
+            (*dst).key_frame = (*self.frame).key_frame;
+            Ok(DecodedFrame { frame: dst })
+        }
+    }
+
     /// Compute average luminance from the Y plane.
     ///
     /// Subsamples every 8th pixel for speed. Returns 0.0-255.0.
@@ -468,6 +569,20 @@ pub struct VideoDecoder {
     ctx: *mut AVCodecContext,
     packet: *mut AVPacket,
     codec: VideoCodec,
+    /// Owned VAAPI hwdevice when this decoder was opened with
+    /// [`DecoderBackend::Vaapi`]. `None` for every other backend. Held
+    /// here so the `AVBufferRef` outlives the codec context — FFmpeg
+    /// holds its own reference via `codec_ctx->hw_device_ctx` but if our
+    /// side dropped the only owning `Arc` first, the buffer could be
+    /// freed mid-decode on a host that doesn't internally bump the
+    /// refcount until `avcodec_open2`.
+    #[allow(dead_code)]
+    vaapi_device: Option<VaapiDevice>,
+    /// The backend this decoder was opened against — matches whatever
+    /// the caller passed to [`Self::open_with_backend`]. Lets the
+    /// display output's resolver tag stats with the right kind without
+    /// re-deriving from the codec name.
+    backend: DecoderBackend,
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -497,7 +612,15 @@ impl VideoDecoder {
     ) -> Result<Self, VideoError> {
         unsafe {
             let av_codec = match backend {
-                DecoderBackend::Cpu => {
+                DecoderBackend::Cpu | DecoderBackend::Vaapi => {
+                    // CPU is the standard SW decoder. VAAPI is a HWACCEL
+                    // attached to the same SW decoder (`hevc` / `h264`)
+                    // — `hevc_vaapi` / `h264_vaapi` aren't separately-
+                    // named entries in libavcodec's decoder table; they
+                    // ride into the codec via `hw_configs` once we set
+                    // `hw_device_ctx` + return `AV_PIX_FMT_VAAPI` from
+                    // the `get_format` callback. This mirrors the
+                    // `examples/hw_decode.c` pattern from upstream.
                     let codec_id = match codec {
                         VideoCodec::H264 => AVCodecID_AV_CODEC_ID_H264,
                         VideoCodec::Hevc => AVCodecID_AV_CODEC_ID_HEVC,
@@ -505,16 +628,12 @@ impl VideoDecoder {
                     };
                     avcodec_find_decoder(codec_id)
                 }
-                DecoderBackend::Nvdec | DecoderBackend::Qsv | DecoderBackend::Vaapi => {
-                    // HW backends are name-keyed (`h264_cuvid`, `hevc_qsv`,
-                    // `h264_vaapi`, ...). Look up the name; non-NULL result
-                    // means the matching `--enable-decoder=*` was passed to
-                    // FFmpeg configure, which corresponds to the Cargo
-                    // feature being on. NB: VAAPI decode additionally needs
-                    // an `AVHWDeviceContext` set on the context before
-                    // `avcodec_open2` — that wiring lands in a follow-up
-                    // session; until then `avcodec_open2` will fail with
-                    // EINVAL when the operator tries to use VAAPI.
+                DecoderBackend::Nvdec | DecoderBackend::Qsv => {
+                    // NVDEC + QSV expose standalone decoder entries
+                    // (`h264_cuvid`, `hevc_qsv`, ...). Look up the name;
+                    // non-NULL result means the matching
+                    // `--enable-decoder=*` was passed to FFmpeg configure,
+                    // which corresponds to the Cargo feature being on.
                     let Some(name) = backend.ffmpeg_decoder_name(codec) else {
                         return Err(VideoError::CodecNotFound(codec));
                     };
@@ -538,15 +657,40 @@ impl VideoDecoder {
             // pattern as the SW decoder.
             (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
 
+            // VAAPI: open a hwdevice on the default render node, hand a
+            // bumped reference to the codec context, and pin the
+            // negotiated pixel format to AV_PIX_FMT_VAAPI via the
+            // `get_format` callback. The callback also lazily allocates
+            // `hw_frames_ctx` once FFmpeg has parsed enough of the
+            // bitstream to size the surface pool.
+            let vaapi_device = if backend == DecoderBackend::Vaapi {
+                let device = match VaapiDevice::open(None) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        avcodec_free_context(&mut { ctx });
+                        return Err(e);
+                    }
+                };
+                (*ctx).hw_device_ctx = device.new_buffer_ref();
+                (*ctx).get_format = Some(vaapi_get_format_callback);
+                Some(device)
+            } else {
+                None
+            };
+
             let ret = avcodec_open2(ctx, av_codec, std::ptr::null_mut());
             if ret < 0 {
+                // Releasing `ctx` also unrefs `hw_device_ctx` we set
+                // above, so the VAAPI hwdevice's refcount drops cleanly.
                 avcodec_free_context(&mut { ctx });
+                drop(vaapi_device);
                 return Err(VideoError::OpenCodec(ret));
             }
 
             let packet = av_packet_alloc();
             if packet.is_null() {
                 avcodec_free_context(&mut { ctx });
+                drop(vaapi_device);
                 return Err(VideoError::AllocPacket);
             }
 
@@ -554,8 +698,18 @@ impl VideoDecoder {
                 ctx,
                 packet,
                 codec,
+                vaapi_device,
+                backend,
             })
         }
+    }
+
+    /// Backend this decoder was opened against. Lets the display
+    /// output's resolver tag per-output stats with the right
+    /// `decoder_kind` label without round-tripping through the codec
+    /// name.
+    pub fn backend(&self) -> DecoderBackend {
+        self.backend
     }
 
     /// Send a packet of compressed video data to the decoder.

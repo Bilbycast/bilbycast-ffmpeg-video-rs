@@ -98,6 +98,47 @@ fn main() {
         .allowlist_function("av_dict_set")
         .allowlist_function("av_dict_free")
         .allowlist_function("av_rescale_q")
+        // ── hwcontext (VAAPI / DRM PRIME runtime plumbing) ──
+        // Powers the bilbycast-edge `display` output's zero-copy path:
+        // open a VAAPI hwdevice on /dev/dri/renderD128, decode into VAAPI
+        // surfaces, map each surface to an `AVDRMFrameDescriptor` (DMA-BUF
+        // fds + fourcc + modifier + plane offsets/strides) and KMS-import
+        // it via `drmModeAddFB2WithModifiers`, eliminating the CPU
+        // YUV→XRGB blit. The codec-side wiring is via `hw_device_ctx`
+        // + the `get_format` callback returning AV_PIX_FMT_VAAPI; the
+        // decoder fills `hw_frames_ctx` automatically when the callback
+        // calls `avcodec_get_hw_frames_parameters`.
+        .allowlist_function("av_hwdevice_ctx_create")
+        .allowlist_function("av_hwdevice_ctx_alloc")
+        .allowlist_function("av_hwdevice_ctx_init")
+        .allowlist_function("av_hwframe_ctx_alloc")
+        .allowlist_function("av_hwframe_ctx_init")
+        .allowlist_function("av_hwframe_map")
+        .allowlist_function("av_hwframe_transfer_data")
+        .allowlist_function("av_hwframe_get_buffer")
+        .allowlist_function("avcodec_get_hw_frames_parameters")
+        .allowlist_function("avcodec_get_hw_config")
+        .allowlist_function("av_buffer_ref")
+        .allowlist_function("av_buffer_unref")
+        .allowlist_function("av_buffer_alloc")
+        .allowlist_type("AVHWDeviceType")
+        .allowlist_type("AVHWDeviceContext")
+        .allowlist_type("AVHWFramesContext")
+        .allowlist_type("AVHWFramesConstraints")
+        .allowlist_type("AVHWAccel")
+        .allowlist_type("AVCodecHWConfig")
+        .allowlist_type("AVVAAPIDeviceContext")
+        .allowlist_type("AVVAAPIFramesContext")
+        .allowlist_type("AVDRMFrameDescriptor")
+        .allowlist_type("AVDRMObjectDescriptor")
+        .allowlist_type("AVDRMLayerDescriptor")
+        .allowlist_type("AVDRMPlaneDescriptor")
+        .allowlist_type("AVDRMDeviceContext")
+        .allowlist_type("AVBufferRef")
+        .allowlist_var("AV_HWDEVICE_TYPE_.*")
+        .allowlist_var("AV_HWFRAME_MAP_.*")
+        .allowlist_var("AV_CODEC_HW_CONFIG_METHOD_.*")
+        .allowlist_var("AV_DRM_MAX_PLANES")
         .allowlist_type("AVDictionary")
         .allowlist_type("AVRational")
         // ── swscale ──
@@ -304,13 +345,27 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--disable-metal".into(),
         "--disable-audiotoolbox".into(),
         "--disable-videotoolbox".into(),
-        // libdrm autodetects from system headers; we don't use FFmpeg's
-        // DRM hwcontext (the bilbycast-edge `display` output drives KMS
-        // directly via the `drm` Rust crate). Leaving it on builds
-        // hwcontext_drm.o into libavutil and forces every downstream
-        // binary to link `-ldrm`. Disable it here.
-        "--disable-libdrm".into(),
     ];
+
+    // libdrm: the bilbycast-edge `display` output drives KMS directly
+    // via the `drm` Rust crate, so historically we disabled libdrm in
+    // FFmpeg to avoid hwcontext_drm.o landing in libavutil and forcing
+    // every downstream binary to link `-ldrm`. The VAAPI zero-copy path
+    // in `display` needs FFmpeg's `vaapi_map_to_drm` (gated on
+    // `CONFIG_LIBDRM` in `libavutil/hwcontext_vaapi.c`) to export a
+    // decoded VAAPI surface as an `AVDRMFrameDescriptor` carrying
+    // DMA-BUF fds the KMS scanout side imports as a PRIME framebuffer.
+    // So flip the rule: keep libdrm off for builds without VAAPI (the
+    // common AGPL-only edge), but enable it whenever any VAAPI feature
+    // is on — they already pull libva-drm and are explicitly opting
+    // into the GPU integration that needs DMA-BUF interop.
+    let drm_required = cfg!(feature = "video-encoder-vaapi")
+        || cfg!(feature = "video-decoder-vaapi");
+    if drm_required {
+        configure_args.push("--enable-libdrm".into());
+    } else {
+        configure_args.push("--disable-libdrm".into());
+    }
 
     // VAAPI auto-detects from `libva` on the host. Even when the
     // operator hasn't enabled `video-encoder-vaapi` / `video-decoder-vaapi`,
@@ -500,6 +555,25 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
              Install libva-dev (it ships libva-drm.pc) to build with the \
              video-encoder-vaapi / video-decoder-vaapi features.",
         );
+        // libdrm: needed for FFmpeg's `vaapi_map_to_drm` (DMA-BUF export
+        // of decoded VAAPI surfaces). Without `--enable-libdrm` +
+        // `<drm_fourcc.h>` headers the DRM PRIME mapping path in
+        // hwcontext_vaapi.c is compiled out and the bilbycast-edge
+        // `display` zero-copy scanout falls back to the CPU blit.
+        let libdrm = pkg_config::Config::new().probe("libdrm").expect(
+            "pkg-config: libdrm not found. \
+             Install libdrm-dev (Debian/Ubuntu) to build with the \
+             video-encoder-vaapi / video-decoder-vaapi features.",
+        );
+        for inc in &libdrm.include_paths {
+            extra_cflags.push(' ');
+            extra_cflags.push_str(&format!("-I{}", inc.display()));
+        }
+        for lp in &libdrm.link_paths {
+            extra_ldflags.push(' ');
+            extra_ldflags.push_str(&format!("-L{}", lp.display()));
+            pkgconfig_paths.push(lp.join("pkgconfig"));
+        }
         configure_args.push("--enable-vaapi".into());
     }
 
@@ -509,8 +583,26 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     }
 
     if cfg!(feature = "video-decoder-vaapi") {
-        configure_args.push("--enable-decoder=h264_vaapi".into());
-        configure_args.push("--enable-decoder=hevc_vaapi".into());
+        // VAAPI decode is implemented as a HWACCEL on the regular SW
+        // decoder (not a separate codec entry like NVDEC's `h264_cuvid`),
+        // so `--enable-hwaccel=*` is the correct flag here. Using
+        // `--enable-decoder=hevc_vaapi` silently no-ops because there's
+        // no decoder of that name — the VAAPI hwaccel rides into the
+        // standard `hevc` / `h264` decoder via `hw_configs` once the
+        // caller sets `hw_device_ctx` + returns `AV_PIX_FMT_VAAPI` from
+        // the `get_format` callback.
+        //
+        // We enable hwaccels for every codec the bilbycast-edge
+        // `display` output can hand a frame for: H.264, HEVC, and
+        // MPEG-2. Keeping `mpeg2_vaapi` on means a DVB-T MPEG-2
+        // source on a host with VAAPI also benefits from the
+        // zero-copy DMA-BUF + KMS-PRIME scanout path — without it
+        // the resolver's Auto-preference for VAAPI would silently
+        // demote MPEG-2 to SW decode (still correct, but the
+        // `decoder_kind` label would lie).
+        configure_args.push("--enable-hwaccel=h264_vaapi".into());
+        configure_args.push("--enable-hwaccel=hevc_vaapi".into());
+        configure_args.push("--enable-hwaccel=mpeg2_vaapi".into());
     }
 
     // Extra cflags / ldflags must be passed last (accumulated across
@@ -642,6 +734,10 @@ fn link_ffmpeg_libs(include_opus: bool) {
             if cfg!(feature = "video-encoder-vaapi") || cfg!(feature = "video-decoder-vaapi") {
                 println!("cargo:rustc-link-lib=va");
                 println!("cargo:rustc-link-lib=va-drm");
+                // libdrm: linked because hwcontext_vaapi.c's DMA-BUF
+                // export path uses `<drm_fourcc.h>` constants; FFmpeg
+                // does not statically vendor libdrm symbols.
+                println!("cargo:rustc-link-lib=drm");
             }
         }
         "macos" => {
