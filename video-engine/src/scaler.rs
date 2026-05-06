@@ -55,7 +55,12 @@ impl ScaledFrame {
             }
             let height = frame.height as usize;
             let plane_rows = match (self.dst_format, idx) {
-                (ScalerDstFormat::Yuvj420p, 1 | 2) => height / 2,
+                // 4:2:0 chroma planes: half-height (rounded up so odd
+                // luma heights still fit, mirroring libavutil's own
+                // allocation `(h + 1) / 2`).
+                (ScalerDstFormat::Yuvj420p | ScalerDstFormat::Yuv420p10le, 1 | 2) => {
+                    (height + 1) / 2
+                }
                 _ => height,
             };
             let slice = std::slice::from_raw_parts(data, linesize * plane_rows);
@@ -100,6 +105,7 @@ fn scaler_dst_pix_fmt(fmt: ScalerDstFormat) -> i32 {
         ScalerDstFormat::Yuvj420p => AVPixelFormat_AV_PIX_FMT_YUVJ420P,
         ScalerDstFormat::Yuv422p8 => AVPixelFormat_AV_PIX_FMT_YUV422P,
         ScalerDstFormat::Yuv422p10le => AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+        ScalerDstFormat::Yuv420p10le => AVPixelFormat_AV_PIX_FMT_YUV420P10LE,
         ScalerDstFormat::Bgra8 => AVPixelFormat_AV_PIX_FMT_BGRA,
     }
 }

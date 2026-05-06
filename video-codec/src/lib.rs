@@ -84,6 +84,12 @@ pub enum ScalerDstFormat {
     Yuv422p8,
     /// Planar YUV 4:2:2, 10-bit little-endian. Broadcast 10-bit.
     Yuv422p10le,
+    /// Planar YUV 4:2:0, 10-bit little-endian. Used when the transcode
+    /// pipeline routes a HW-decoded `P010LE` (cuvid / QSV / VAAPI 10-bit
+    /// 4:2:0) frame into the SW encoder input plane set, or when an
+    /// operator picks `chroma=yuv420p, bit_depth=10` and the input
+    /// happens to be 8-bit.
+    Yuv420p10le,
     /// Packed BGRA 8-bit (`B G R A` byte order in memory). Matches the
     /// XRGB8888 little-endian framebuffer layout used by Linux KMS dumb
     /// buffers, so a single `sws_scale` writes pixels straight onto the
@@ -378,7 +384,11 @@ impl VideoPreset {
 ///
 /// High10 / High422 / High444 enable 10-bit and higher-chroma profiles on
 /// libx264 (compile-time profile gates in upstream libx264 — the vendored
-/// build enables all three). `Main10` is the HEVC 10-bit profile.
+/// build enables all three). `Main10` is the HEVC 10-bit distribution
+/// profile; `Main422_10` and `Main422_10Intra` are the canonical HEVC
+/// broadcast-contribution profiles (4:2:2 10-bit) — both libx265 and
+/// hevc_vaapi accept the string spellings (`main422-10` /
+/// `main422-10-intra`) through `av_dict_set("profile", ...)` at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoProfile {
     #[default]
@@ -390,6 +400,8 @@ pub enum VideoProfile {
     High422,
     High444,
     Main10,
+    Main422_10,
+    Main422_10Intra,
 }
 
 impl VideoProfile {
@@ -403,6 +415,8 @@ impl VideoProfile {
             Self::High422 => Some("high422"),
             Self::High444 => Some("high444"),
             Self::Main10 => Some("main10"),
+            Self::Main422_10 => Some("main422-10"),
+            Self::Main422_10Intra => Some("main422-10-intra"),
         }
     }
 }

@@ -51,3 +51,27 @@ pub fn silence_ffmpeg_logs() {
         libffmpeg_video_sys::av_log_set_level(libffmpeg_video_sys::AV_LOG_QUIET as i32);
     }
 }
+
+/// `true` when the raw FFmpeg `AVPixelFormat` integer (as exposed by
+/// [`DecodedFrame::pixel_format`]) is one of the planar YUV layouts
+/// drainable through [`DecodedFrame::yuv_planes`]. Companion to
+/// [`DecodedFrame::is_planar_yuv`] for callers that don't have a live
+/// frame yet — the lazy-open path of bilbycast-edge's
+/// `ScaledVideoEncoder` queries this from inside `try_build_scaler` to
+/// decide whether to wire a libswscale conversion stage between a
+/// semi-planar / hardware source and the SW encoder's planar input.
+pub fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
+    use libffmpeg_video_sys::*;
+    av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV420P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUVJ420P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV420P10LE
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV420P12LE
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV422P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUVJ422P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV422P10LE
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV422P12LE
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV444P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUVJ444P
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV444P10LE
+        || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV444P12LE
+}

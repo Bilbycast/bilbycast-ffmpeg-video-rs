@@ -238,6 +238,34 @@ impl DecodedFrame {
         }
     }
 
+    /// `true` when this frame's `pixel_format()` is one of the planar
+    /// YUV layouts that [`Self::yuv_planes`] can drain into three
+    /// separate Y/U/V byte slices. Used by the SW-encoder feed path
+    /// (`bilbycast-edge/src/engine/video_encode_util.rs`) to decide
+    /// whether the decoded frame can go straight to
+    /// `VideoEncoder::encode_frame` or whether libswscale has to
+    /// convert a semi-planar (NV12 / NV16 / P010LE / P210LE) /
+    /// hardware (`AV_PIX_FMT_VAAPI` / `AV_PIX_FMT_QSV` /
+    /// `AV_PIX_FMT_CUDA`) / packed (`AV_PIX_FMT_BGRA`, …) source first.
+    ///
+    /// Stays in lock-step with the `match` arm in [`Self::yuv_planes`]:
+    /// any format added there must also flip this predicate to `true`.
+    pub fn is_planar_yuv(&self) -> bool {
+        let f = self.pixel_format();
+        f == AVPixelFormat_AV_PIX_FMT_YUV420P
+            || f == AVPixelFormat_AV_PIX_FMT_YUVJ420P
+            || f == AVPixelFormat_AV_PIX_FMT_YUV420P10LE
+            || f == AVPixelFormat_AV_PIX_FMT_YUV420P12LE
+            || f == AVPixelFormat_AV_PIX_FMT_YUV422P
+            || f == AVPixelFormat_AV_PIX_FMT_YUVJ422P
+            || f == AVPixelFormat_AV_PIX_FMT_YUV422P10LE
+            || f == AVPixelFormat_AV_PIX_FMT_YUV422P12LE
+            || f == AVPixelFormat_AV_PIX_FMT_YUV444P
+            || f == AVPixelFormat_AV_PIX_FMT_YUVJ444P
+            || f == AVPixelFormat_AV_PIX_FMT_YUV444P10LE
+            || f == AVPixelFormat_AV_PIX_FMT_YUV444P12LE
+    }
+
     /// Access the two planes of an NV12 frame (Y + interleaved UV).
     ///
     /// Returns `Some((y, y_stride, uv, uv_stride))` when the pixel

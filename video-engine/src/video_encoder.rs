@@ -135,6 +135,30 @@ fn vaapi_sw_format_for(chroma: VideoChroma, bit_depth: u8) -> AVPixelFormat {
     }
 }
 
+/// Pick the QSV system-memory layout for the caller's chroma + bit-depth.
+/// FFmpeg's `h264_qsv` / `hevc_qsv` wrappers reject `yuv420p` at
+/// `avcodec_open2` (`AVERROR_EINVAL`, `Specified pixel format yuv420p is
+/// not supported`); the encoders only accept the NV-style semi-planar
+/// surfaces (`nv12` / `p010le` / `nv16` / `p210le` in sysmem, or `qsv`
+/// hwframes). bilbycast uses the sysmem NV-style layout — the QSV
+/// wrapper internally uploads the bytes onto an `mfxFrameSurface1` GPU
+/// surface so we don't need to wire a `hw_frames_ctx` here. The
+/// per-call packer is identical in shape to the VAAPI sysmem source
+/// (Y plane direct copy + U/V byte-interleaved into the chroma plane);
+/// the encoder consumes `self.frame` directly, no `av_hwframe_transfer_data`
+/// step.
+fn qsv_pix_fmt_for(chroma: VideoChroma, bit_depth: u8) -> AVPixelFormat {
+    match (chroma, bit_depth) {
+        (VideoChroma::Yuv420, 8) => AVPixelFormat_AV_PIX_FMT_NV12,
+        (VideoChroma::Yuv420, 10) => AVPixelFormat_AV_PIX_FMT_P010LE,
+        (VideoChroma::Yuv422, 8) => AVPixelFormat_AV_PIX_FMT_NV16,
+        (VideoChroma::Yuv422, 10) => AVPixelFormat_AV_PIX_FMT_P210LE,
+        // Yuv444 + non-{8,10} bit depths are rejected at the top of
+        // `VideoEncoder::open()` so they never reach this function.
+        _ => AVPixelFormat_AV_PIX_FMT_NV12,
+    }
+}
+
 // SAFETY: AVCodecContext is per-instance with no shared global state.
 unsafe impl Send for VideoEncoder {}
 
@@ -321,6 +345,29 @@ impl VideoEncoder {
             // U/V byte-interleaved into the chroma plane) handles both
             // — the only thing that differs is the chroma plane row
             // count, which `chroma_height()` already encodes.
+            // QSV: override `pix_fmt` to the NV-style sysmem layout
+            // FFmpeg's `h264_qsv` / `hevc_qsv` wrappers actually accept
+            // (NV12 / P010LE / NV16 / P210LE). The previous code passed
+            // through `yuv420p` from `resolve_pix_fmt`, which trips
+            // `avcodec_open2` with `AVERROR_EINVAL` and the operator-
+            // visible "Specified pixel format yuv420p is not supported
+            // by the h264_qsv encoder" log line. The probe at
+            // `probe.rs::probe_pix_fmt_for_chroma` already uses NV12 for
+            // QSV; the runtime encoder open just needed to match.
+            // FFmpeg's QSV wrapper internally copies the sysmem bytes
+            // onto an `mfxFrameSurface1` GPU surface — we don't need to
+            // wire `hw_frames_ctx` here. The per-frame packer is the
+            // same shape as the VAAPI sysmem source (Y plane direct
+            // copy + U/V byte-interleaved into the chroma plane), but
+            // writes straight into `self.frame`.
+            let is_qsv = matches!(
+                config.codec,
+                VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
+            );
+            if is_qsv {
+                (*ctx).pix_fmt = qsv_pix_fmt_for(config.chroma, config.bit_depth);
+            }
+
             let mut vaapi_device: Option<VaapiDevice> = None;
             let mut hw_frames_ref: *mut AVBufferRef = std::ptr::null_mut();
             let is_vaapi = matches!(
@@ -726,6 +773,8 @@ impl VideoEncoder {
         unsafe {
             if self.is_vaapi() {
                 self.encode_frame_vaapi(y, y_stride, u, u_stride, v, v_stride, hh, ww, pts)
+            } else if self.is_qsv() {
+                self.encode_frame_qsv(y, y_stride, u, u_stride, v, v_stride, hh, ww, pts)
             } else {
                 self.encode_frame_sw(y, y_stride, u, u_stride, v, v_stride, hh, pts)
             }
@@ -737,6 +786,17 @@ impl VideoEncoder {
         matches!(
             self.codec,
             VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi
+        )
+    }
+
+    /// True when this encoder is opened against a QSV backend. The
+    /// encoder context's `pix_fmt` is one of the NV-style semi-planar
+    /// sysmem formats (NV12 / P010LE / NV16 / P210LE) — the encoder
+    /// frame's `data[0]` is the Y plane and `data[1]` is interleaved UV.
+    fn is_qsv(&self) -> bool {
+        matches!(
+            self.codec,
+            VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
         )
     }
 
@@ -771,6 +831,94 @@ impl VideoEncoder {
         // a keyframe on the first frame after a switch, regardless of
         // where we are in the current GOP. Always reset to NONE on
         // normal frames so the encoder's rate control stays in charge.
+        if self.force_idr_next {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
+            self.force_idr_next = false;
+        } else {
+            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+        }
+
+        self.send_and_receive()
+    }
+
+    /// QSV encode path: pack the caller's planar YUV planes into
+    /// `self.frame` in NV12 / P010LE / NV16 / P210LE layout (Y plane
+    /// direct copy + U/V byte-interleaved into the chroma plane).
+    /// FFmpeg's QSV wrapper accepts the sysmem semi-planar surface
+    /// directly and uploads it onto an `mfxFrameSurface1` GPU surface
+    /// internally, so there's no `hw_frames_ctx` / `av_hwframe_transfer_data`
+    /// dance — `self.frame` is consumed by `avcodec_send_frame` exactly
+    /// like the SW backends do, just with the matching pix_fmt the
+    /// encoder advertises in its `pix_fmts` list.
+    ///
+    /// Same per-call shape as `encode_frame_vaapi` but writes directly
+    /// into `self.frame` (the encoder-input frame, allocated at open
+    /// time with `av_frame_get_buffer` against the `nv12` / `p010le`
+    /// pix_fmt the QSV branch installed on the codec context).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_frame_qsv(
+        &mut self,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        u_stride: usize,
+        v: &[u8],
+        v_stride: usize,
+        hh: usize,
+        ww: usize,
+        pts: Option<i64>,
+    ) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
+        let h = self.height as usize;
+        let w = self.width as usize;
+
+        if self.bit_depth == 8 {
+            // 8-bit path: NV12 (4:2:0) or NV16 (4:2:2). Y plane is a
+            // direct byte copy; chroma plane interleaves U + V bytes.
+            // `hh` differentiates the two layouts: H/2 for 4:2:0,
+            // H for 4:2:2.
+            copy_plane(
+                (*self.frame).data[0],
+                (*self.frame).linesize[0],
+                y,
+                y_stride,
+                h,
+            );
+            interleave_uv_8bit(
+                (*self.frame).data[1],
+                (*self.frame).linesize[1],
+                u,
+                u_stride,
+                v,
+                v_stride,
+                ww,
+                hh,
+            );
+        } else {
+            // 10-bit path: P010LE (4:2:0) or P210LE (4:2:2). Same
+            // low-10 → upper-10 shift the VAAPI 10-bit path uses.
+            copy_plane_10bit_lo_to_hi(
+                (*self.frame).data[0],
+                (*self.frame).linesize[0],
+                y,
+                y_stride,
+                h,
+                w,
+            );
+            interleave_uv_10bit_lo_to_hi(
+                (*self.frame).data[1],
+                (*self.frame).linesize[1],
+                u,
+                u_stride,
+                v,
+                v_stride,
+                ww,
+                hh,
+            );
+        }
+
+        (*self.frame).pts = pts.unwrap_or(self.frame_count);
+        self.frame_count = (*self.frame).pts + 1;
+
         if self.force_idr_next {
             (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
             self.force_idr_next = false;
