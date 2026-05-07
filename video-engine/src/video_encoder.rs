@@ -538,6 +538,79 @@ impl VideoEncoder {
                 }
             }
 
+            // ── Low-latency settings for QSV / NVENC / VAAPI ─────────────
+            //
+            // Each HW encoder has its own internal pipeline depth that, by
+            // default, prioritises throughput over latency. Left alone, the
+            // pipeline buffers ~1 second of frames between input and output
+            // — small for VOD, fatal for live transcode because audio (which
+            // has ~zero pipeline depth) emits at source rate while video
+            // lags by the encoder's buffer. The receiver sees audio's PTS
+            // racing ahead of video's PTS and shows lip-sync drift on the
+            // order of the encoder buffer.
+            //
+            // Forcing `async_depth = 1` on QSV and the equivalent settings
+            // on the other HW backends collapses the pipeline to one-frame-
+            // in / one-frame-out, matching the audio encoder's real-time
+            // behaviour and keeping A/V locked together end-to-end.
+            if matches!(
+                config.codec,
+                VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
+            ) {
+                let async_depth_key = std::ffi::CString::new("async_depth").unwrap();
+                let async_depth_val = std::ffi::CString::new("1").unwrap();
+                av_dict_set(
+                    &mut opts,
+                    async_depth_key.as_ptr(),
+                    async_depth_val.as_ptr(),
+                    0,
+                );
+                // Disable the rate-control look-ahead window (FFmpeg's QSV
+                // wrapper exposes this as `look_ahead`). HEVC QSV defaults
+                // to off; H.264 QSV defaults to on. Forcing it off for
+                // both keeps live latency predictable.
+                let lookahead_key = std::ffi::CString::new("look_ahead").unwrap();
+                let lookahead_val = std::ffi::CString::new("0").unwrap();
+                av_dict_set(
+                    &mut opts,
+                    lookahead_key.as_ptr(),
+                    lookahead_val.as_ptr(),
+                    0,
+                );
+            } else if matches!(
+                config.codec,
+                VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc
+            ) {
+                // NVENC's lookahead defaults to 0; explicitly pin it for
+                // safety and force `delay = 0` so the encoder emits frame
+                // N immediately after frame N is sent (no async pipeline).
+                let delay_key = std::ffi::CString::new("delay").unwrap();
+                let delay_val = std::ffi::CString::new("0").unwrap();
+                av_dict_set(&mut opts, delay_key.as_ptr(), delay_val.as_ptr(), 0);
+                let zerolat_key = std::ffi::CString::new("zerolatency").unwrap();
+                let zerolat_val = std::ffi::CString::new("1").unwrap();
+                av_dict_set(
+                    &mut opts,
+                    zerolat_key.as_ptr(),
+                    zerolat_val.as_ptr(),
+                    0,
+                );
+            } else if matches!(
+                config.codec,
+                VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi
+            ) {
+                // VAAPI's `async_depth` plays the same role as QSV's; pin
+                // to 1 for live transcoding.
+                let async_depth_key = std::ffi::CString::new("async_depth").unwrap();
+                let async_depth_val = std::ffi::CString::new("1").unwrap();
+                av_dict_set(
+                    &mut opts,
+                    async_depth_key.as_ptr(),
+                    async_depth_val.as_ptr(),
+                    0,
+                );
+            }
+
             let ret = avcodec_open2(ctx, codec_ptr, &mut opts);
             av_dict_free(&mut opts);
             if ret < 0 {
