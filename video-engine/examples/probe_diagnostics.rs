@@ -14,7 +14,8 @@
 use video_engine::{
     count_max_decoder_sessions, count_max_encoder_sessions, is_decoder_available,
     is_encoder_available, probe_open_decoder, probe_open_encoder,
-    probe_open_encoder_chroma, ProbeChroma,
+    probe_open_encoder_chroma, ProbeChroma, PROBE_HEIGHT_1080P, PROBE_HEIGHT_4K,
+    PROBE_WIDTH_1080P, PROBE_WIDTH_4K,
 };
 
 fn main() {
@@ -75,8 +76,10 @@ fn main() {
     }
 
     // Concurrent-session capacity per family — the loop opens 1, 2, 3, …
-    // sessions and counts the successful ones until one fails (cap 8).
-    println!("\nEncoder session capacity (cap 8):");
+    // sessions at the requested resolution and counts the successful
+    // ones until one fails. 1080p caps at 32 to cover pro-class GPUs;
+    // 4K caps at 8 to bound startup time and avoid VRAM exhaustion.
+    println!("\nEncoder session capacity (1080p cap 32, 4K cap 8):");
     let session_probes = [
         ("nvenc h264", "h264_nvenc"),
         ("qsv h264", "h264_qsv"),
@@ -86,18 +89,22 @@ fn main() {
         if !is_encoder_available(name) {
             continue;
         }
-        let max = count_max_encoder_sessions(name, 8);
-        println!("  {:<14} → {}", label, max);
+        let max_1080p =
+            count_max_encoder_sessions(name, 32, PROBE_WIDTH_1080P, PROBE_HEIGHT_1080P);
+        let max_4k = count_max_encoder_sessions(name, 8, PROBE_WIDTH_4K, PROBE_HEIGHT_4K);
+        println!("  {:<14} → 1080p {} · 4K {}", label, max_1080p, max_4k);
     }
 
-    println!("\nDecoder session capacity (cap 8):");
+    println!("\nDecoder session capacity (1080p cap 32, 4K cap 8):");
     let session_probes_dec = [("nvdec h264", "h264_cuvid"), ("qsv decode h264", "h264_qsv")];
     for (label, name) in session_probes_dec {
         if !is_decoder_available(name) {
             continue;
         }
-        let max = count_max_decoder_sessions(name, 8);
-        println!("  {:<14} → {}", label, max);
+        let max_1080p =
+            count_max_decoder_sessions(name, 32, PROBE_WIDTH_1080P, PROBE_HEIGHT_1080P);
+        let max_4k = count_max_decoder_sessions(name, 8, PROBE_WIDTH_4K, PROBE_HEIGHT_4K);
+        println!("  {:<14} → 1080p {} · 4K {}", label, max_1080p, max_4k);
     }
 
     // Per-codec chroma + bit-depth matrix. Only printed for codecs the

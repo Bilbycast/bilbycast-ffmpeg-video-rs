@@ -167,7 +167,8 @@ pub fn probe_open_encoder_chroma(name: &str, chroma: ProbeChroma) -> Result<(), 
         if codec_ptr.is_null() {
             return Err(ProbeError::NotCompiled);
         }
-        try_open_encoder_context(codec_ptr, pix_fmt).map(|ctx| free_encoder_context(ctx))
+        try_open_encoder_context(codec_ptr, pix_fmt, PROBE_WIDTH, PROBE_HEIGHT)
+            .map(|ctx| free_encoder_context(ctx))
     }
 }
 
@@ -180,7 +181,8 @@ pub fn probe_open_decoder(name: &str) -> Result<(), ProbeError> {
         if codec_ptr.is_null() {
             return Err(ProbeError::NotCompiled);
         }
-        try_open_decoder_context(codec_ptr).map(|ctx| free_encoder_context(ctx))
+        try_open_decoder_context(codec_ptr, PROBE_WIDTH, PROBE_HEIGHT)
+            .map(|ctx| free_encoder_context(ctx))
     }
 }
 
@@ -189,15 +191,27 @@ pub fn probe_open_decoder(name: &str) -> Result<(), ProbeError> {
 /// is reached, returning the count of successful opens. Releases every
 /// context before returning.
 ///
+/// `width`/`height` choose the probe frame size — pass
+/// `PROBE_WIDTH_1080P` × `PROBE_HEIGHT_1080P` for the HD baseline
+/// session-count probe, or `PROBE_WIDTH_4K` × `PROBE_HEIGHT_4K` for the
+/// optional 4K-grade probe. Larger frames consume more VRAM / engine
+/// resources at `avcodec_open2` time, so 4K capacity is typically lower
+/// than 1080p capacity on the same GPU.
+///
 /// On NVENC consumer cards (3–5 session cap depending on driver patch),
 /// this triggers the cap right at startup — returns 3, 4, or 5. On pro
 /// cards the cap is far higher; we report `upper_bound` to keep startup
-/// fast and just say "≥N". Default `upper_bound` from the caller is 8.
+/// fast and just say "≥N".
 ///
 /// Returns `0` if the very first open fails (codec is unavailable at
-/// runtime — caller should already have filtered via
-/// [`probe_open_encoder`]).
-pub fn count_max_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
+/// runtime, or refuses the requested resolution — caller should already
+/// have filtered via [`probe_open_encoder`]).
+pub fn count_max_encoder_sessions(
+    name: &str,
+    upper_bound: u32,
+    width: i32,
+    height: i32,
+) -> u32 {
     let cstr = match std::ffi::CString::new(name) {
         Ok(c) => c,
         Err(_) => return 0,
@@ -214,7 +228,7 @@ pub fn count_max_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
         let mut held: Vec<*mut AVCodecContext> = Vec::with_capacity(upper_bound as usize);
         let mut count: u32 = 0;
         while count < upper_bound {
-            match try_open_encoder_context(codec_ptr, pix_fmt) {
+            match try_open_encoder_context(codec_ptr, pix_fmt, width, height) {
                 Ok(ctx) => {
                     held.push(ctx);
                     count += 1;
@@ -330,7 +344,12 @@ pub fn probe_open_vaapi_encoder_chroma(
 /// every successfully-opened encoder until the loop ends, then drops
 /// them all (Drop releases the VAAPI surface pools + the codec context).
 #[cfg(feature = "video-encoder-vaapi")]
-pub fn count_max_vaapi_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
+pub fn count_max_vaapi_encoder_sessions(
+    name: &str,
+    upper_bound: u32,
+    width: u32,
+    height: u32,
+) -> u32 {
     use video_codec::{VideoEncoderCodec, VideoEncoderConfig};
 
     let codec = match name {
@@ -340,8 +359,8 @@ pub fn count_max_vaapi_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
     };
     let cfg = VideoEncoderConfig {
         codec,
-        width: PROBE_WIDTH as u32,
-        height: PROBE_HEIGHT as u32,
+        width,
+        height,
         fps_num: PROBE_FPS_NUM as u32,
         fps_den: 1,
         bitrate_kbps: (PROBE_BITRATE / 1000) as u32,
@@ -363,12 +382,25 @@ pub fn count_max_vaapi_encoder_sessions(name: &str, upper_bound: u32) -> u32 {
 }
 
 #[cfg(not(feature = "video-encoder-vaapi"))]
-pub fn count_max_vaapi_encoder_sessions(_name: &str, _upper_bound: u32) -> u32 {
+pub fn count_max_vaapi_encoder_sessions(
+    _name: &str,
+    _upper_bound: u32,
+    _width: u32,
+    _height: u32,
+) -> u32 {
     0
 }
 
-/// Decoder twin of [`count_max_encoder_sessions`].
-pub fn count_max_decoder_sessions(name: &str, upper_bound: u32) -> u32 {
+/// Decoder twin of [`count_max_encoder_sessions`]. `width`/`height`
+/// hint the coded dimensions before `avcodec_open2` so HW decoders that
+/// pre-allocate session resources at open time reflect the realistic
+/// workload class.
+pub fn count_max_decoder_sessions(
+    name: &str,
+    upper_bound: u32,
+    width: i32,
+    height: i32,
+) -> u32 {
     let cstr = match std::ffi::CString::new(name) {
         Ok(c) => c,
         Err(_) => return 0,
@@ -381,7 +413,7 @@ pub fn count_max_decoder_sessions(name: &str, upper_bound: u32) -> u32 {
         let mut held: Vec<*mut AVCodecContext> = Vec::with_capacity(upper_bound as usize);
         let mut count: u32 = 0;
         while count < upper_bound {
-            match try_open_decoder_context(codec_ptr) {
+            match try_open_decoder_context(codec_ptr, width, height) {
                 Ok(ctx) => {
                     held.push(ctx);
                     count += 1;
@@ -400,9 +432,25 @@ pub fn count_max_decoder_sessions(name: &str, upper_bound: u32) -> u32 {
 
 /// Minimum probe frame size — chosen to satisfy NVENC's 145-pixel minimum
 /// width and QSV's even-dimension requirement. 320×240 is universally
-/// accepted across libx264 / libx265 / NVENC / QSV.
-const PROBE_WIDTH: i32 = 320;
-const PROBE_HEIGHT: i32 = 240;
+/// accepted across libx264 / libx265 / NVENC / QSV. Used by the
+/// single-shot "can this codec open at all" probes (`probe_open_encoder`,
+/// `probe_open_decoder`) where session-count is irrelevant.
+pub const PROBE_WIDTH: i32 = 320;
+pub const PROBE_HEIGHT: i32 = 240;
+/// 1080p probe size — what the resource-budget session-count probe uses
+/// to measure realistic concurrent session capacity for HD-tier
+/// broadcast workloads. Bigger than the synthetic minimum, so HW
+/// backends that allocate engine slots / VRAM at `avcodec_open2` time
+/// (NVENC, QSV, AMF, VAAPI) reflect the real workload, not a
+/// surface-pool optimisation that lets 320×240 sessions slip through.
+pub const PROBE_WIDTH_1080P: i32 = 1920;
+pub const PROBE_HEIGHT_1080P: i32 = 1080;
+/// 4K UHD probe size — for the optional second-tier session-count probe
+/// that reports per-family 4K-grade capacity separately. Capacity at 4K
+/// is typically materially smaller than at 1080p (VRAM, engine
+/// throughput) on consumer GPUs.
+pub const PROBE_WIDTH_4K: i32 = 3840;
+pub const PROBE_HEIGHT_4K: i32 = 2160;
 const PROBE_FPS_NUM: i32 = 25;
 const PROBE_BITRATE: i64 = 1_000_000;
 const PROBE_GOP: i32 = 25;
@@ -534,16 +582,25 @@ fn probe_pix_fmt_for_chroma(name: &str, chroma: ProbeChroma) -> Option<AVPixelFo
 /// `avcodec_open2`. Returns the opened context on success — caller must
 /// free via [`free_encoder_context`]. Reused by both the one-shot
 /// probe-open and the loop-open session-count probe.
+///
+/// `width`/`height` parameterise the probe frame size: the single-shot
+/// callers pass `PROBE_WIDTH` × `PROBE_HEIGHT` (320×240, the universal
+/// minimum that satisfies every backend); the session-count callers
+/// pass `PROBE_WIDTH_1080P` × `PROBE_HEIGHT_1080P` or `PROBE_WIDTH_4K`
+/// × `PROBE_HEIGHT_4K` to measure realistic concurrent capacity at the
+/// resolutions production flows actually run.
 unsafe fn try_open_encoder_context(
     codec_ptr: *const AVCodec,
     pix_fmt: AVPixelFormat,
+    width: i32,
+    height: i32,
 ) -> Result<*mut AVCodecContext, ProbeError> {
     let ctx = avcodec_alloc_context3(codec_ptr);
     if ctx.is_null() {
         return Err(ProbeError::AllocFailed);
     }
-    (*ctx).width = PROBE_WIDTH;
-    (*ctx).height = PROBE_HEIGHT;
+    (*ctx).width = width;
+    (*ctx).height = height;
     (*ctx).pix_fmt = pix_fmt;
     (*ctx).time_base.num = 1;
     (*ctx).time_base.den = PROBE_FPS_NUM;
@@ -564,8 +621,11 @@ unsafe fn try_open_encoder_context(
 
 /// Allocate + configure a decoder `AVCodecContext` and call
 /// `avcodec_open2`. Decoders auto-detect dimensions from the first
-/// packet, so we leave width/height at 0 — the open call only needs the
-/// codec descriptor + sane time_base.
+/// packet at runtime, but we still set `coded_width`/`coded_height`
+/// (and `width`/`height`) before open so HW decoders that pre-allocate
+/// per-session resources at `avcodec_open2` time (cuvid / qsv / vaapi
+/// when given a sized hint) reflect the actual workload class. Software
+/// decoders ignore the hint.
 ///
 /// After `avcodec_open2` succeeds we additionally walk the codec's
 /// advertised `pix_fmts` list and reject decoders whose only output
@@ -581,6 +641,8 @@ unsafe fn try_open_encoder_context(
 /// "advertised format but driver lies" case.
 unsafe fn try_open_decoder_context(
     codec_ptr: *const AVCodec,
+    width: i32,
+    height: i32,
 ) -> Result<*mut AVCodecContext, ProbeError> {
     let ctx = avcodec_alloc_context3(codec_ptr);
     if ctx.is_null() {
@@ -591,6 +653,12 @@ unsafe fn try_open_decoder_context(
     (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
     (*ctx).time_base.num = 1;
     (*ctx).time_base.den = PROBE_FPS_NUM;
+    if width > 0 && height > 0 {
+        (*ctx).coded_width = width;
+        (*ctx).coded_height = height;
+        (*ctx).width = width;
+        (*ctx).height = height;
+    }
 
     let ret = avcodec_open2(ctx, codec_ptr, std::ptr::null_mut());
     if ret < 0 {

@@ -39,7 +39,8 @@ pub use probe::{
     count_max_decoder_sessions, count_max_encoder_sessions, count_max_vaapi_encoder_sessions,
     is_decoder_available, is_encoder_available, probe_open_decoder, probe_open_encoder,
     probe_open_encoder_chroma, probe_open_vaapi_encoder, probe_open_vaapi_encoder_chroma,
-    ProbeChroma, ProbeError,
+    ProbeChroma, ProbeError, PROBE_HEIGHT, PROBE_HEIGHT_1080P, PROBE_HEIGHT_4K, PROBE_WIDTH,
+    PROBE_WIDTH_1080P, PROBE_WIDTH_4K,
 };
 pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
 pub use thumbnail::{decode_thumbnail, decode_thumbnail_packets};
