@@ -522,10 +522,19 @@ impl VideoEncoder {
                     av_dict_set(&mut opts, rc_key.as_ptr(), rc_val.as_ptr(), 0);
                 }
             } else if matches!(config.rate_control, VideoRateControl::Cbr) {
-                // Surface CBR to x264's HRD so the bitstream carries
-                // nal-hrd=cbr; NVENC has a native `rc=cbr` switch.
+                // Surface CBR explicitly per backend:
+                //   x264 / x265 — bitstream HRD signalling (`nal-hrd=cbr`).
+                //   NVENC      — native `rc=cbr` private option.
+                //   VAAPI      — native `rc_mode=CBR` private option.
+                //   QSV        — auto-selects MFX_RATECONTROL_CBR from
+                //                bit_rate == rc_min_rate == rc_max_rate
+                //                (set above); no private option exists.
                 if matches!(config.codec, VideoEncoderCodec::X264) {
                     let xkey = std::ffi::CString::new("x264-params").unwrap();
+                    let xval = std::ffi::CString::new("nal-hrd=cbr").unwrap();
+                    av_dict_set(&mut opts, xkey.as_ptr(), xval.as_ptr(), 0);
+                } else if matches!(config.codec, VideoEncoderCodec::X265) {
+                    let xkey = std::ffi::CString::new("x265-params").unwrap();
                     let xval = std::ffi::CString::new("nal-hrd=cbr").unwrap();
                     av_dict_set(&mut opts, xkey.as_ptr(), xval.as_ptr(), 0);
                 } else if matches!(
@@ -534,6 +543,13 @@ impl VideoEncoder {
                 ) {
                     let rc_key = std::ffi::CString::new("rc").unwrap();
                     let rc_val = std::ffi::CString::new("cbr").unwrap();
+                    av_dict_set(&mut opts, rc_key.as_ptr(), rc_val.as_ptr(), 0);
+                } else if matches!(
+                    config.codec,
+                    VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi
+                ) {
+                    let rc_key = std::ffi::CString::new("rc_mode").unwrap();
+                    let rc_val = std::ffi::CString::new("CBR").unwrap();
                     av_dict_set(&mut opts, rc_key.as_ptr(), rc_val.as_ptr(), 0);
                 }
             }
