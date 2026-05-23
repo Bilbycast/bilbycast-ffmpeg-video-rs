@@ -123,6 +123,49 @@ fn bytes_per_sample(bit_depth: u8) -> usize {
 /// sites in `open()` are reachable only when the VAAPI codec branch
 /// passed the feature gate, so non-VAAPI builds compile this as
 /// dead code.
+/// Translate an operator-facing profile string into the form the given
+/// FFmpeg backend understands.
+///
+/// libx264 / libx265 keep their own profile tables — their FFmpeg wrappers
+/// route the option through `x264_param_apply_profile` /
+/// `x265_param_apply_profile` and the broadcast contribution spellings
+/// (`high422`, `main422-10`, `main422-10-intra`, …) round-trip fine.
+///
+/// The HW backends (`hevc_vaapi`, `hevc_qsv`, `hevc_nvenc`) and the
+/// generic H.264 path use libavcodec's `ff_hevc_profiles` /
+/// `ff_h264_profiles` tables — which use FFmpeg's canonical names. So we
+/// translate the well-known x264 / x265 spellings into those.
+///
+/// Returns the input verbatim when no translation is needed (every code
+/// path that does not match a known x264 / x265 alias preserves the
+/// operator's string, including future profile names we do not know
+/// about yet).
+fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> &str {
+    // x264 / x265 backends route through their own param-apply machinery —
+    // pass through verbatim. Same for any non-HW backend we add in the
+    // future that the operator-facing names are written against.
+    if matches!(codec, VideoEncoderCodec::X264 | VideoEncoderCodec::X265) {
+        return profile;
+    }
+    // libavcodec HEVC backends: `ff_hevc_profiles` canonical names.
+    // 4:2:2 10-bit is encoded under FF_PROFILE_HEVC_REXT → "Rext".
+    // The intra-only variant is signalled by the bitstream constraint
+    // flag, not a separate profile_id — the same "Rext" entry covers it.
+    match profile {
+        "main422-10" | "main422-10-intra" => "rext",
+        // libx264 4:2:2 8-bit profile maps to FF_PROFILE_H264_HIGH_422.
+        // The generic AVOption name is "High 4:2:2", but operators write
+        // it as "high422" everywhere in the bilbycast schema.
+        "high422" => "high422",
+        // libx264 4:4:4 8-bit → FF_PROFILE_H264_HIGH_444_PREDICTIVE.
+        "high444" => "high444",
+        // Everything else (Main, Main10, baseline, main, high, high10, …)
+        // already matches the canonical name and round-trips through
+        // av_dict_set without remapping.
+        other => other,
+    }
+}
+
 fn vaapi_sw_format_for(chroma: VideoChroma, bit_depth: u8) -> AVPixelFormat {
     match (chroma, bit_depth) {
         (VideoChroma::Yuv420, 8) => AVPixelFormat_AV_PIX_FMT_NV12,
@@ -476,8 +519,20 @@ impl VideoEncoder {
             av_dict_set(&mut opts, preset_key.as_ptr(), preset_val.as_ptr(), 0);
 
             if let Some(profile) = config.profile.as_str() {
+                // x264 / x265 carry their own profile tables (e.g. x265
+                // understands "main422-10", "main422-10-intra"); pass through
+                // verbatim there. The HW backends (hevc_vaapi, hevc_qsv,
+                // hevc_nvenc) parse `profile` against libavcodec's generic
+                // `ff_hevc_profiles` / `ff_h264_profiles` tables which use
+                // *FFmpeg's* canonical names — "Main", "Main 10", "Rext",
+                // "High 4:2:2", etc. Operator-facing config (and the doc
+                // matrix) uses the x264 / x265 spellings everywhere, so
+                // remap before handing them to a HW backend or
+                // `avcodec_open2` returns an opaque EINVAL (the symptom
+                // that surfaced as F1's sibling regression in cellPTP7b).
+                let remapped = translate_profile_for_backend(config.codec, profile);
                 let profile_key = std::ffi::CString::new("profile").unwrap();
-                let profile_val = std::ffi::CString::new(profile).unwrap();
+                let profile_val = std::ffi::CString::new(remapped).unwrap();
                 av_dict_set(&mut opts, profile_key.as_ptr(), profile_val.as_ptr(), 0);
             }
 
