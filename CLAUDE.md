@@ -7,15 +7,16 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 - **Video decode:** H.264 / HEVC / MPEG-1 / MPEG-2 (the libavcodec `mpeg2video` decoder accepts both MPEG-1 and MPEG-2 bitstreams)
 - **Video scale:** libswscale (currently only YUVJ420P output — see deferred items)
 - **Video encode:** MJPEG (thumbnails, always on) + **optional** libx264 / libx265 / NVENC via opt-in Cargo features
-- **Audio:** Opus, MP2, AC-3 encoding (AAC is handled by `bilbycast-fdk-aac-rs`)
+- **Audio decode:** Opus / MP2 / AC-3 / E-AC-3 / AAC-LATM (non-AAC-LC broadcast codecs; AAC-LC decode is handled by `bilbycast-fdk-aac-rs`)
+- **Audio encode:** Opus, MP2, AC-3 (AAC encode is handled by `bilbycast-fdk-aac-rs`)
 
 ## Projects
 
 | Crate | Role |
 |-------|------|
-| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `vendor/ffmpeg/` (n7.1.3) + `vendor/opus/` (v1.5.2). |
+| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n7.1.3) + `libffmpeg-video-sys/vendor/opus` (v1.5.2). |
 | **video-codec** | Pure-Rust data types (video/audio codec enums, errors, config). No C dependency. |
-| **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`. The crate bilbycast-edge depends on. |
+| **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioDecoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`. The crate bilbycast-edge depends on. |
 
 ## Codec Support
 
@@ -27,6 +28,10 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 | MJPEG encode | Yes (thumbnails) |
 | Frame scaling | Yes (Lanczos via libswscale) |
 | Black-screen detection | Yes (Y-plane luminance) |
+| Opus audio decode | Yes (via vendored libopus, falls back to FFmpeg native) |
+| MP2 audio decode | Yes (FFmpeg native) |
+| AC-3 / E-AC-3 audio decode | Yes (FFmpeg native) |
+| AAC-LATM audio decode | Yes (FFmpeg native — LATM/LOAS-framed AAC, `stream_type=0x11`) |
 | Opus audio encode | Yes (via vendored libopus) |
 | MP2 audio encode | Yes (FFmpeg native) |
 | AC-3 audio encode | Yes (FFmpeg native) |
@@ -157,6 +162,14 @@ operators get a clear error, not opaque `avcodec_open2` EINVAL):
 5. Encode as JPEG
 
 Returns `ThumbnailResult { jpeg, luminance, source_width, source_height }`.
+
+### Audio Decoder (`video-engine/src/audio_decoder.rs`)
+
+`AudioDecoder` wraps FFmpeg's `AVCodecContext` + `SwrContext` for the non-AAC-LC broadcast audio codecs (AAC-LC decode lives in `bilbycast-fdk-aac-rs`):
+- `open(codec)` — create decoder for `Mp2`, `Ac3`, `Eac3`, `Opus`, or `AacLatm` (the `AudioDecoderCodec` enum in `video-codec`). Opus prefers libopus, falling back to FFmpeg's native decoder.
+- `send_packet(data, pts)` — feed one encoded frame; PTS rides through in the codec time base
+- `receive_frame()` → `DecodedAudioFrame` in planar f32 PCM (resampled via the lazily-allocated `SwrContext`)
+- `flush()` — reset decoder state
 
 ### Audio Encoder (`video-engine/src/audio_encoder.rs`)
 
