@@ -83,6 +83,28 @@ pub struct VideoEncoder {
     /// `av_hwframe_transfer_data` to populate the VAAPI surface. Null
     /// for non-VAAPI backends.
     sw_frame: *mut AVFrame,
+    /// QSV pipelined-submission input-frame ring. Empty for non-QSV
+    /// backends and for QSV at `async_depth <= 1` (synchronous mode,
+    /// which keeps reusing `self.frame`).
+    ///
+    /// Forward-proofing, not load-bearing in the vendored n7.1.3:
+    /// qsvenc's zero-copy submit branch (`av_frame_replace`,
+    /// qsvenc.c) is gated on `data[1] - data[0] ==
+    /// linesize[0] * FFALIGN(height, height_align)`, which frames from
+    /// `av_frame_get_buffer` can never satisfy (libavutil inserts
+    /// 32-byte inter-plane padding), and the flagship heights (1080,
+    /// 2160) independently fail `height_align` — so qsvenc copies every
+    /// submission into its own continuous buffer and holds no reference
+    /// to ours. A single reused frame would therefore be safe *today*.
+    /// The copy gate is FFmpeg-internal, though, and a vendored bump
+    /// could make the zero-copy branch reachable, at which point a
+    /// reused frame is overwritten while the GPU still reads it — the
+    /// ring (`async_depth + 2` slots, strictly more than the encoder
+    /// can hold in flight) plus the per-slot writability re-arm in
+    /// `encode_frame_qsv` make that future safe and allocation-free.
+    qsv_ring: Vec<*mut AVFrame>,
+    /// Next `qsv_ring` slot to pack into.
+    qsv_ring_idx: usize,
 }
 
 /// Resolve `(chroma, bit_depth)` to an FFmpeg `AVPixelFormat`. Returns
@@ -410,6 +432,14 @@ impl VideoEncoder {
             if is_qsv {
                 (*ctx).pix_fmt = qsv_pix_fmt_for(config.chroma, config.bit_depth);
             }
+            // Effective QSV pipeline depth: 0 means "unset" and behaves
+            // like 1 (synchronous). Clamp the top so a wild config value
+            // can't make libmfx allocate an absurd surface pool.
+            let qsv_async_depth: u32 = if is_qsv {
+                config.async_depth.max(1).min(16)
+            } else {
+                1
+            };
 
             let mut vaapi_device: Option<VaapiDevice> = None;
             let mut hw_frames_ref: *mut AVBufferRef = std::ptr::null_mut();
@@ -620,16 +650,28 @@ impl VideoEncoder {
             // racing ahead of video's PTS and shows lip-sync drift on the
             // order of the encoder buffer.
             //
-            // Forcing `async_depth = 1` on QSV and the equivalent settings
-            // on the other HW backends collapses the pipeline to one-frame-
-            // in / one-frame-out, matching the audio encoder's real-time
-            // behaviour and keeping A/V locked together end-to-end.
+            // The default `async_depth = 1` on QSV (config.async_depth
+            // unset) and the equivalent settings on the other HW backends
+            // collapse the pipeline to one-frame-in / one-frame-out,
+            // matching the audio encoder's real-time behaviour and keeping
+            // A/V locked together end-to-end.
+            //
+            // Throughput-critical callers (ST 2110 uncompressed-video
+            // ingest, where the source raster outruns a per-frame
+            // submit-then-sync round trip — hevc_qsv caps at ~30 fps on
+            // 2160p50 synchronously vs 85 fps pipelined on the same iGPU)
+            // opt IN to pipelining via `config.async_depth > 1`. That
+            // keeps `async_depth` frames in flight: latency grows by the
+            // depth, PTS pass through unchanged, and the rate-control
+            // look-ahead window stays disabled either way so the ~1 s
+            // buffering failure mode can't return.
             if matches!(
                 config.codec,
                 VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
             ) {
                 let async_depth_key = std::ffi::CString::new("async_depth").unwrap();
-                let async_depth_val = std::ffi::CString::new("1").unwrap();
+                let async_depth_val =
+                    std::ffi::CString::new(qsv_async_depth.to_string()).unwrap();
                 av_dict_set(
                     &mut opts,
                     async_depth_key.as_ptr(),
@@ -756,13 +798,57 @@ impl VideoEncoder {
                 (*frame).width = (*ctx).width;
                 (*frame).height = (*ctx).height;
                 (*frame).format = (*ctx).pix_fmt;
-                let ret = av_frame_get_buffer(frame, 32);
-                if ret < 0 {
-                    let mut f = frame;
-                    let mut c = ctx;
-                    av_frame_free(&mut f);
-                    avcodec_free_context(&mut c);
-                    return Err(VideoEncoderError::AllocFrameBuffer(ret));
+                // QSV pipelined mode packs into the ring below instead of
+                // `self.frame` — skip the (large, never-used) buffer.
+                if !(is_qsv && qsv_async_depth > 1) {
+                    let ret = av_frame_get_buffer(frame, 32);
+                    if ret < 0 {
+                        let mut f = frame;
+                        let mut c = ctx;
+                        av_frame_free(&mut f);
+                        avcodec_free_context(&mut c);
+                        return Err(VideoEncoderError::AllocFrameBuffer(ret));
+                    }
+                }
+            }
+
+            // QSV pipelined mode: pre-allocate the input-frame ring (see
+            // the `qsv_ring` field doc — forward-proofing against a
+            // future zero-copy qsvenc; n7.1.3 copies every submission).
+            // `async_depth + 2` slots — the encoder can hold at most
+            // `async_depth` submissions in flight, plus slack for the
+            // one being packed.
+            let mut qsv_ring: Vec<*mut AVFrame> = Vec::new();
+            if is_qsv && qsv_async_depth > 1 {
+                for _ in 0..(qsv_async_depth as usize + 2) {
+                    let rf = av_frame_alloc();
+                    let ret = if rf.is_null() {
+                        0
+                    } else {
+                        (*rf).width = (*ctx).width;
+                        (*rf).height = (*ctx).height;
+                        (*rf).format = (*ctx).pix_fmt;
+                        av_frame_get_buffer(rf, 32)
+                    };
+                    if rf.is_null() || ret < 0 {
+                        if !rf.is_null() {
+                            let mut rf2 = rf;
+                            av_frame_free(&mut rf2);
+                        }
+                        for slot in qsv_ring.iter_mut() {
+                            av_frame_free(slot);
+                        }
+                        let mut f = frame;
+                        let mut c = ctx;
+                        av_frame_free(&mut f);
+                        avcodec_free_context(&mut c);
+                        return Err(if rf.is_null() {
+                            VideoEncoderError::AllocFrame
+                        } else {
+                            VideoEncoderError::AllocFrameBuffer(ret)
+                        });
+                    }
+                    qsv_ring.push(rf);
                 }
             }
 
@@ -774,6 +860,9 @@ impl VideoEncoder {
                 if !sw_frame.is_null() {
                     let mut sf = sw_frame;
                     av_frame_free(&mut sf);
+                }
+                for slot in qsv_ring.iter_mut() {
+                    av_frame_free(slot);
                 }
                 avcodec_free_context(&mut c);
                 if !hw_frames_ref.is_null() {
@@ -813,6 +902,8 @@ impl VideoEncoder {
                 vaapi_device,
                 hw_frames_ref,
                 sw_frame,
+                qsv_ring,
+                qsv_ring_idx: 0,
             })
         }
     }
@@ -995,10 +1086,16 @@ impl VideoEncoder {
     /// like the SW backends do, just with the matching pix_fmt the
     /// encoder advertises in its `pix_fmts` list.
     ///
-    /// Same per-call shape as `encode_frame_vaapi` but writes directly
-    /// into `self.frame` (the encoder-input frame, allocated at open
-    /// time with `av_frame_get_buffer` against the `nv12` / `p010le`
-    /// pix_fmt the QSV branch installed on the codec context).
+    /// Same per-call shape as `encode_frame_vaapi`. In synchronous mode
+    /// (`async_depth <= 1`) it writes directly into `self.frame` (the
+    /// encoder-input frame, allocated at open time with
+    /// `av_frame_get_buffer` against the `nv12` / `p010le` pix_fmt the
+    /// QSV branch installed on the codec context). In pipelined mode
+    /// (`async_depth > 1`) it rotates through `self.qsv_ring` instead —
+    /// in vendored n7.1.3 qsvenc copies every sysmem submission (see
+    /// the `qsv_ring` field doc), so the rotation is defence-in-depth
+    /// for a future FFmpeg where the zero-copy submit branch becomes
+    /// reachable and the encoder holds refs to in-flight frames.
     #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame_qsv(
         &mut self,
@@ -1015,21 +1112,44 @@ impl VideoEncoder {
         let h = self.height as usize;
         let w = self.width as usize;
 
+        let frame = if self.qsv_ring.is_empty() {
+            self.frame
+        } else {
+            let f = self.qsv_ring[self.qsv_ring_idx];
+            self.qsv_ring_idx = (self.qsv_ring_idx + 1) % self.qsv_ring.len();
+            // Never fires in vendored n7.1.3 (qsvenc copies every
+            // submission, holds no ref — slots stay writable). If a
+            // future FFmpeg starts holding refs deeper than the ring's
+            // slack, re-arm the slot with a fresh buffer instead of
+            // scribbling over bytes the GPU is still reading.
+            if av_frame_is_writable(f) == 0 {
+                av_frame_unref(f);
+                (*f).width = (*self.ctx).width;
+                (*f).height = (*self.ctx).height;
+                (*f).format = (*self.ctx).pix_fmt;
+                let ret = av_frame_get_buffer(f, 32);
+                if ret < 0 {
+                    return Err(VideoEncoderError::AllocFrameBuffer(ret));
+                }
+            }
+            f
+        };
+
         if self.bit_depth == 8 {
             // 8-bit path: NV12 (4:2:0) or NV16 (4:2:2). Y plane is a
             // direct byte copy; chroma plane interleaves U + V bytes.
             // `hh` differentiates the two layouts: H/2 for 4:2:0,
             // H for 4:2:2.
             copy_plane(
-                (*self.frame).data[0],
-                (*self.frame).linesize[0],
+                (*frame).data[0],
+                (*frame).linesize[0],
                 y,
                 y_stride,
                 h,
             );
             interleave_uv_8bit(
-                (*self.frame).data[1],
-                (*self.frame).linesize[1],
+                (*frame).data[1],
+                (*frame).linesize[1],
                 u,
                 u_stride,
                 v,
@@ -1041,16 +1161,16 @@ impl VideoEncoder {
             // 10-bit path: P010LE (4:2:0) or P210LE (4:2:2). Same
             // low-10 → upper-10 shift the VAAPI 10-bit path uses.
             copy_plane_10bit_lo_to_hi(
-                (*self.frame).data[0],
-                (*self.frame).linesize[0],
+                (*frame).data[0],
+                (*frame).linesize[0],
                 y,
                 y_stride,
                 h,
                 w,
             );
             interleave_uv_10bit_lo_to_hi(
-                (*self.frame).data[1],
-                (*self.frame).linesize[1],
+                (*frame).data[1],
+                (*frame).linesize[1],
                 u,
                 u_stride,
                 v,
@@ -1060,17 +1180,17 @@ impl VideoEncoder {
             );
         }
 
-        (*self.frame).pts = pts.unwrap_or(self.frame_count);
-        self.frame_count = (*self.frame).pts + 1;
+        (*frame).pts = pts.unwrap_or(self.frame_count);
+        self.frame_count = (*frame).pts + 1;
 
         if self.force_idr_next {
-            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
+            (*frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
             self.force_idr_next = false;
         } else {
-            (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
+            (*frame).pict_type = AVPictureType_AV_PICTURE_TYPE_NONE;
         }
 
-        self.send_and_receive()
+        self.send_frame_and_drain(frame)
     }
 
     /// VAAPI encode path: pack the caller's planar YUV planes into the
@@ -1199,7 +1319,19 @@ impl VideoEncoder {
     }
 
     unsafe fn send_and_receive(&mut self) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
-        let ret = avcodec_send_frame(self.ctx, self.frame);
+        self.send_frame_and_drain(self.frame)
+    }
+
+    /// Submit `frame` (which may be `self.frame` or a `qsv_ring` slot)
+    /// and drain every packet the encoder has ready. In QSV pipelined
+    /// mode the first `async_depth - 1` submissions legitimately drain
+    /// zero packets while the pipeline fills; callers already handle
+    /// empty results (warm-up contract).
+    unsafe fn send_frame_and_drain(
+        &mut self,
+        frame: *mut AVFrame,
+    ) -> Result<Vec<EncodedVideoFrame>, VideoEncoderError> {
+        let ret = avcodec_send_frame(self.ctx, frame);
         if ret < 0 {
             return Err(VideoEncoderError::SendFrame(ret));
         }
@@ -1243,6 +1375,11 @@ impl Drop for VideoEncoder {
             }
             if !self.sw_frame.is_null() {
                 av_frame_free(&mut self.sw_frame);
+            }
+            for slot in self.qsv_ring.iter_mut() {
+                if !slot.is_null() {
+                    av_frame_free(slot);
+                }
             }
             if !self.ctx.is_null() {
                 // `avcodec_free_context` unrefs `hw_device_ctx` and
@@ -1489,6 +1626,143 @@ mod tests {
             ..Default::default()
         };
         assert!(VideoEncoder::open(&cfg).is_err());
+    }
+
+    /// QSV pipelined submission (`async_depth = 4`): every input frame
+    /// must come out exactly once with its PTS preserved — the input
+    /// ring rotation must not drop, duplicate, or corrupt in-flight
+    /// frames, and `flush()` must drain the pipeline tail.
+    ///
+    /// Needs working Intel QSV hardware at runtime; skips (with a log
+    /// line) when `open` fails so CI hosts without an iGPU stay green.
+    #[cfg(feature = "video-encoder-qsv")]
+    #[test]
+    fn qsv_pipelined_encode_emits_every_frame_once() {
+        let cfg = VideoEncoderConfig {
+            codec: VideoEncoderCodec::H264Qsv,
+            width: 320,
+            height: 240,
+            fps_num: 50,
+            fps_den: 1,
+            bitrate_kbps: 1000,
+            gop_size: 25,
+            async_depth: 4,
+            ..Default::default()
+        };
+        let mut enc = match VideoEncoder::open(&cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("QSV unavailable on this host ({e:?}); skipping");
+                return;
+            }
+        };
+
+        let n_frames = 24usize;
+        let mut got_pts = Vec::new();
+        let mut warmup_empties = 0usize;
+        for i in 0..n_frames {
+            // Distinct luma per frame so a buffer-reuse bug would show
+            // up as encoder-side corruption rather than identical input.
+            let y = vec![(i as u8).wrapping_mul(10); 320 * 240];
+            let u = vec![128u8; 160 * 120];
+            let v = vec![128u8; 160 * 120];
+            let out = enc
+                .encode_frame(&y, 320, &u, 160, &v, 160, Some(i as i64 * 1800))
+                .expect("encode");
+            if out.is_empty() && got_pts.is_empty() {
+                warmup_empties += 1;
+            }
+            for f in &out {
+                assert!(!f.data.is_empty(), "encoded frame must carry bitstream");
+            }
+            got_pts.extend(out.iter().map(|f| f.pts));
+        }
+        got_pts.extend(enc.flush().expect("flush").iter().map(|f| f.pts));
+
+        got_pts.sort_unstable();
+        let expect: Vec<i64> = (0..n_frames as i64).map(|i| i * 1800).collect();
+        assert_eq!(
+            got_pts, expect,
+            "every submitted frame must come out exactly once with its PTS"
+        );
+        // The pipeline should actually pipeline: at least one early
+        // submission returns no packet while the fifo fills.
+        assert!(
+            warmup_empties >= 1,
+            "async_depth=4 should defer the first packet past the first submit"
+        );
+    }
+
+    /// Manual 2160p hevc_qsv throughput comparison: synchronous
+    /// (async_depth=1) vs pipelined (async_depth=4). Run with:
+    ///
+    /// ```sh
+    /// cargo test --release -p video-engine --features video-encoder-qsv \
+    ///   qsv_4k_throughput -- --ignored --nocapture
+    /// ```
+    ///
+    /// Ignored by default — it needs Intel QSV hardware, takes seconds,
+    /// and asserts only that the pipelined run is not slower (the real
+    /// pass criterion — ≈ wire rate for 2160p50 — is read from the
+    /// printed numbers and verified live on the ST 2110 rig).
+    #[cfg(feature = "video-encoder-qsv")]
+    #[test]
+    #[ignore]
+    fn qsv_4k_throughput_sync_vs_pipelined() {
+        const W: usize = 3840;
+        const H: usize = 2160;
+        let y = vec![100u8; W * H];
+        let u = vec![128u8; (W / 2) * (H / 2)];
+        let v = vec![128u8; (W / 2) * (H / 2)];
+
+        let mut run = |depth: u32| -> Option<f64> {
+            let cfg = VideoEncoderConfig {
+                codec: VideoEncoderCodec::HevcQsv,
+                width: W as u32,
+                height: H as u32,
+                fps_num: 50,
+                fps_den: 1,
+                bitrate_kbps: 40_000,
+                gop_size: 50,
+                async_depth: depth,
+                ..Default::default()
+            };
+            let mut enc = match VideoEncoder::open(&cfg) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("QSV unavailable ({e:?}); skipping");
+                    return None;
+                }
+            };
+            // Warm-up fills the pipeline + first-GOP rate-control churn.
+            for i in 0..10i64 {
+                let _ = enc.encode_frame(&y, W, &u, W / 2, &v, W / 2, Some(i)).unwrap();
+            }
+            let n = 100i64;
+            let t0 = std::time::Instant::now();
+            let mut out_frames = 0usize;
+            for i in 10..10 + n {
+                out_frames += enc
+                    .encode_frame(&y, W, &u, W / 2, &v, W / 2, Some(i))
+                    .unwrap()
+                    .len();
+            }
+            out_frames += enc.flush().unwrap().len();
+            let el = t0.elapsed().as_secs_f64();
+            let fps = n as f64 / el;
+            eprintln!(
+                "hevc_qsv 2160p async_depth={depth}: {fps:.1} fps submit rate, {out_frames} frames drained in {el:.2}s"
+            );
+            Some(fps)
+        };
+
+        let Some(sync_fps) = run(1) else { return };
+        let Some(piped_fps) = run(4) else { return };
+        eprintln!("speedup: {:.2}x", piped_fps / sync_fps);
+        assert!(
+            piped_fps >= sync_fps * 0.95,
+            "pipelined must not be slower: sync {sync_fps:.1} fps vs piped {piped_fps:.1} fps"
+        );
     }
 
     #[cfg(feature = "video-encoder-x264")]

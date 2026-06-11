@@ -87,6 +87,7 @@ fn main() {
         .allowlist_function("av_frame_free")
         .allowlist_function("av_frame_unref")
         .allowlist_function("av_frame_get_buffer")
+        .allowlist_function("av_frame_is_writable")
         .allowlist_function("av_image_get_buffer_size")
         .allowlist_function("av_image_fill_arrays")
         .allowlist_function("av_opt_set")

@@ -548,6 +548,18 @@ pub struct VideoEncoderConfig {
     /// Emit SPS/PPS (or VPS/SPS/PPS) as a separate extradata blob
     /// instead of inside the bitstream. Required for RTP / RTMP / MP4.
     pub global_header: bool,
+    /// HW-encoder pipeline depth — how many frames may be in flight
+    /// inside the encoder before a sync is forced. `0` or `1` =
+    /// synchronous one-frame-in / one-frame-out (the live-transcode
+    /// default: one frame of output latency, audio and video emission
+    /// stay locked). Values > 1 enable pipelined submission — currently
+    /// honoured by the **QSV** backends only: the GPU encodes frame N
+    /// while frames N+1.. are being submitted, which is the difference
+    /// between ~30 fps (per-frame sync) and wire rate on 2160p50
+    /// ingest. Output PTS values pass through unchanged, so the cost is
+    /// `async_depth` frames of latency, not A/V skew. Clamped to 16 at
+    /// open; other backends ignore the field.
+    pub async_depth: u32,
 }
 
 impl Default for VideoEncoderConfig {
@@ -576,6 +588,7 @@ impl Default for VideoEncoderConfig {
             color_matrix: String::new(),
             color_range: String::new(),
             global_header: true,
+            async_depth: 0,
         }
     }
 }
