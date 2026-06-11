@@ -622,7 +622,18 @@ impl VideoDecoder {
     ///
     /// Equivalent to [`open_with_backend`] with `DecoderBackend::Cpu`.
     pub fn open(codec: VideoCodec) -> Result<Self, VideoError> {
-        Self::open_with_backend(codec, DecoderBackend::Cpu)
+        Self::open_inner(codec, DecoderBackend::Cpu, false)
+    }
+
+    /// Open a software decoder with libavcodec auto-threading (frame +
+    /// slice, `thread_count = 0`). Trades a constant pipeline delay of
+    /// up to `thread_count` frames for multi-core decode throughput.
+    /// Use on throughput-bound paths (ST 2110-20/-23 uncompressed
+    /// egress, where UHD HEVC decode must sustain the full frame rate),
+    /// NOT on latency-sensitive consumers (local display, in-place
+    /// transcode) where the added decode latency shifts A/V alignment.
+    pub fn open_threaded(codec: VideoCodec) -> Result<Self, VideoError> {
+        Self::open_inner(codec, DecoderBackend::Cpu, true)
     }
 
     /// Open a decoder for the specified video codec, selecting the
@@ -637,6 +648,14 @@ impl VideoDecoder {
     pub fn open_with_backend(
         codec: VideoCodec,
         backend: DecoderBackend,
+    ) -> Result<Self, VideoError> {
+        Self::open_inner(codec, backend, false)
+    }
+
+    fn open_inner(
+        codec: VideoCodec,
+        backend: DecoderBackend,
+        auto_threads: bool,
     ) -> Result<Self, VideoError> {
         unsafe {
             let av_codec = match backend {
@@ -684,6 +703,14 @@ impl VideoDecoder {
             // internally and tolerate the same partial-packet feeding
             // pattern as the SW decoder.
             (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
+
+            // libavcodec defaults to thread_count = 1 (single-threaded).
+            // Must be set before avcodec_open2. CPU backend only — HW
+            // decoders manage their own session parallelism.
+            if auto_threads && backend == DecoderBackend::Cpu {
+                (*ctx).thread_count = 0; // auto: one per core, capped by FFmpeg
+                (*ctx).thread_type = 3; // FF_THREAD_FRAME | FF_THREAD_SLICE
+            }
 
             // VAAPI: open a hwdevice on the default render node, hand a
             // bumped reference to the codec context, and pin the
