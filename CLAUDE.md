@@ -5,7 +5,7 @@
 Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for the bilbycast ecosystem. Provides safe, in-process media processing — replacing all ffmpeg subprocess dependencies in bilbycast-edge:
 
 - **Video decode:** H.264 / HEVC / MPEG-1 / MPEG-2 (the libavcodec `mpeg2video` decoder accepts both MPEG-1 and MPEG-2 bitstreams)
-- **Video scale:** libswscale (currently only YUVJ420P output — see deferred items)
+- **Video scale:** libswscale (YUVJ420P, YUV422P 8/10-bit, YUV420P 10-bit, BGRA output via `ScalerDstFormat`)
 - **Video encode:** MJPEG (thumbnails, always on) + **optional** libx264 / libx265 / NVENC via opt-in Cargo features
 - **Audio decode:** Opus / MP2 / AC-3 / E-AC-3 / AAC-LATM (non-AAC-LC broadcast codecs; AAC-LC decode is handled by `bilbycast-fdk-aac-rs`)
 - **Audio encode:** Opus, MP2, AC-3 (AAC encode is handled by `bilbycast-fdk-aac-rs`)
