@@ -30,7 +30,7 @@ fn main() {
             "cargo:rustc-link-search=native={}",
             ffmpeg_path.join("lib").display()
         );
-        link_ffmpeg_libs(false);
+        link_ffmpeg_libs(false, &GplEncoderLink::default());
         ffmpeg_path.join("include")
     } else if cfg!(feature = "system-ffmpeg") {
         // System FFmpeg via pkg-config
@@ -195,6 +195,54 @@ fn main() {
     bindings
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("failed to write bindings.rs");
+}
+
+/// Where the static archives for the GPL video encoders live, if findable.
+///
+/// libx264 / libx265 are dynamically linked by default, which ties the final
+/// binary to the build host's `libx264.so.<X264_BUILD>` / `libx265.so.<api>`
+/// SONAME — and those SONAMEs *are* the upstream build number, which bumps on
+/// every distro release (Ubuntu 24.04 ships libx264.so.164 / libx265.so.199;
+/// 26.04 ships libx264.so.165 / libx265.so.215, which are ABI-incompatible —
+/// x264 even token-pastes the build number into the exported symbol names, so
+/// a soname symlink fails at the symbol level). A dynamically-linked binary
+/// therefore only runs on the exact distro release it was built against.
+/// Preferring a static archive bakes the encoder into the binary so it has no
+/// runtime DT_NEEDED on libx264/libx265 and runs on any host of the same arch.
+#[derive(Default)]
+struct GplEncoderLink {
+    /// Directory containing `libx264.a`, when a static link is possible.
+    x264_static_dir: Option<PathBuf>,
+    /// Directory containing `libx265.a`, when a static link is possible.
+    x265_static_dir: Option<PathBuf>,
+}
+
+/// Locate a static archive `lib<name>.a` on the probe's link paths or the
+/// platform's standard library directories, returning its containing dir.
+///
+/// pkg-config suppresses `-L` for the standard system library directories, so
+/// a distro-shipped archive (e.g. Debian/Ubuntu's `libx265.a` in the multiarch
+/// dir) never appears in `probe_link_paths` — we must search the well-known
+/// dirs explicitly. Archives surfaced via a non-standard prefix (e.g. a
+/// from-source static `libx264.a` on `PKG_CONFIG_PATH`) *do* show up in
+/// `probe_link_paths`, so we check those first.
+fn find_static_archive(name: &str, probe_link_paths: &[PathBuf]) -> Option<PathBuf> {
+    let archive = format!("lib{name}.a");
+    let mut dirs: Vec<PathBuf> = probe_link_paths.to_vec();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let triplet = match arch.as_str() {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        _ => None,
+    };
+    if let Some(t) = triplet {
+        dirs.push(PathBuf::from(format!("/usr/lib/{t}")));
+        dirs.push(PathBuf::from(format!("/usr/local/lib/{t}")));
+    }
+    dirs.push(PathBuf::from("/usr/lib"));
+    dirs.push(PathBuf::from("/usr/lib64"));
+    dirs.push(PathBuf::from("/usr/local/lib"));
+    dirs.into_iter().find(|d| d.join(&archive).is_file())
 }
 
 /// Build libopus from vendored source using CMake.
@@ -412,6 +460,10 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-gpl".into());
     }
 
+    // Static-vs-dynamic decision for the GPL encoders is made here (we have the
+    // pkg-config probe link paths) and applied in `link_ffmpeg_libs`.
+    let mut gpl_link = GplEncoderLink::default();
+
     if cfg!(feature = "video-encoder-x264") {
         let x264 = pkg_config::Config::new()
             .probe("x264")
@@ -429,6 +481,7 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             extra_ldflags.push_str(&format!("-L{}", lp.display()));
             pkgconfig_paths.push(lp.join("pkgconfig"));
         }
+        gpl_link.x264_static_dir = find_static_archive("x264", &x264.link_paths);
         configure_args.push("--enable-libx264".into());
         configure_args.push("--enable-encoder=libx264".into());
     }
@@ -450,6 +503,7 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             extra_ldflags.push_str(&format!("-L{}", lp.display()));
             pkgconfig_paths.push(lp.join("pkgconfig"));
         }
+        gpl_link.x265_static_dir = find_static_archive("x265", &x265.link_paths);
         configure_args.push("--enable-libx265".into());
         configure_args.push("--enable-encoder=libx265".into());
     }
@@ -676,12 +730,12 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // Also add opus lib path so the linker can find libopus
     println!("cargo:rustc-link-search=native={}", opus_lib.display());
-    link_ffmpeg_libs(true);
+    link_ffmpeg_libs(true, &gpl_link);
 
     install_dir.join("include")
 }
 
-fn link_ffmpeg_libs(include_opus: bool) {
+fn link_ffmpeg_libs(include_opus: bool, gpl: &GplEncoderLink) {
     // Order matters: avcodec depends on avutil; swscale and swresample
     // both depend on avutil. swresample is consumed by the audio decoder
     // for sample-format conversion.
@@ -695,37 +749,76 @@ fn link_ffmpeg_libs(include_opus: bool) {
         println!("cargo:rustc-link-lib=static=opus");
     }
 
-    // Optional video encoder libraries. These must be findable by the
-    // system linker; the pkg-config probes above already emitted
-    // `cargo:rustc-link-search=` directives. We only have to name them
-    // here so the final rustc invocation pulls them in.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Optional GPL video encoder libraries (libx264 / libx265). These must
+    // appear AFTER libavcodec on the link line because avcodec references
+    // their symbols. PREFER a static link (see `GplEncoderLink`): baking the
+    // encoder in means the final binary carries no runtime DT_NEEDED on
+    // libx264.so.<build> / libx265.so.<build>, whose SONAMEs bump on every
+    // distro release and are ABI-incompatible across releases. Fall back to a
+    // dynamic link with a loud warning when no static archive is available.
     if cfg!(feature = "video-encoder-x264") {
-        // libx264 is typically shipped statically; prefer static but
-        // fall back to dylib lookup if the system only has .so/.dylib.
-        println!("cargo:rustc-link-lib=x264");
+        if let Some(dir) = &gpl.x264_static_dir {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=x264");
+        } else {
+            println!("cargo:rustc-link-lib=x264");
+            println!("cargo:warning=libffmpeg-video-sys: no static libx264.a found — linking libx264 DYNAMICALLY. The binary will require the build host's libx264.so.<build> SONAME at runtime and will NOT start on a distro shipping a different x264 build (e.g. Ubuntu 26.04's libx264.so.165 vs 24.04's .164 — x264 bakes the build number into its symbol names, so a soname symlink also fails). Build x264 with `--enable-static` and put its prefix on PKG_CONFIG_PATH for a portable binary.");
+        }
     }
     if cfg!(feature = "video-encoder-x265") {
-        println!("cargo:rustc-link-lib=x265");
-        // libx265 is C++; pull in the C++ runtime so the static link
-        // succeeds on Linux.
-        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let x265_static = gpl.x265_static_dir.is_some();
+        if let Some(dir) = &gpl.x265_static_dir {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=x265");
+        } else {
+            println!("cargo:rustc-link-lib=x265");
+            println!("cargo:warning=libffmpeg-video-sys: no static libx265.a found — linking libx265 DYNAMICALLY. The binary will require the build host's libx265.so SONAME at runtime and will NOT start on a distro shipping a different x265 build (e.g. Ubuntu 26.04's libx265.so.215 vs 24.04's .199). Install libx265-dev (ships libx265.a on Debian/Ubuntu) for a portable static link.");
+        }
+        // libx265 is C++; pull in the C++ runtime so the link resolves.
         if target_os == "linux" {
             println!("cargo:rustc-link-lib=stdc++");
+            // A static libx265.a's transitive deps are no longer satisfied by
+            // a shared object — they become DIRECT deps of the final binary.
+            // libnuma is x265's NUMA-topology dep (x265.pc Libs.private:
+            // `-lnuma`). Link it STATICALLY too when a libnuma.a is available
+            // (libnuma-dev) so the binary gains no runtime DT_NEEDED on
+            // libnuma.so.1 — otherwise we'd just relocate the "won't start on
+            // a minimal image" failure from libx265.so to libnuma.so.1. Falls
+            // back to a dynamic numa link (host must have libnuma1) if no .a.
+            // Must come after x265 on the link line.
+            if x265_static {
+                if let Some(dir) = find_static_archive("numa", &[]) {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                    println!("cargo:rustc-link-lib=static=numa");
+                } else {
+                    println!("cargo:rustc-link-lib=numa");
+                    println!("cargo:warning=libffmpeg-video-sys: libx265 is statically linked but no libnuma.a was found — linking libnuma DYNAMICALLY. The binary will require libnuma.so.1 at runtime (install libnuma1 on the target, or libnuma-dev at build time for a fully self-contained static link).");
+                }
+            }
         } else if target_os == "macos" {
             println!("cargo:rustc-link-lib=c++");
         }
     }
 
     // Platform-specific system libs that FFmpeg requires
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-lib=m");
             println!("cargo:rustc-link-lib=pthread");
             // NVENC + NVDEC both load `libnvcuvid.so.1` / `libnvidia-encode.so.1`
             // dynamically through `dlopen` at runtime, so `-ldl` is required
-            // whenever either feature is on.
-            if cfg!(feature = "video-encoder-nvenc") || cfg!(feature = "video-decoder-nvdec") {
+            // whenever either feature is on. A STATIC libx264.a / libx265.a
+            // also pulls `-ldl` from its Libs.private — so emit it for those
+            // too, decoupling the GPL-encoder static link from the NVENC
+            // feature. Harmless no-op on glibc ≥ 2.34 (dl merged into libc),
+            // correct on older toolchains.
+            if cfg!(feature = "video-encoder-nvenc")
+                || cfg!(feature = "video-decoder-nvdec")
+                || gpl.x264_static_dir.is_some()
+                || gpl.x265_static_dir.is_some()
+            {
                 println!("cargo:rustc-link-lib=dl");
             }
             // VAAPI: libva (the dispatch core) + libva-drm (render-node
