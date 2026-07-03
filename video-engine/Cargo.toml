@@ -21,6 +21,13 @@ video-encoder-qsv = ["libffmpeg-video-sys/video-encoder-qsv"]
 # at build time and a working VAAPI driver at runtime (Mesa radeonsi
 # for AMD, iHD for Intel). Primary motivation: AMD-on-Linux encode.
 video-encoder-vaapi = ["libffmpeg-video-sys/video-encoder-vaapi"]
+# RKMPP encode (ARM Rockchip SoCs only — RK3568/RK3588). Pulls in
+# `--enable-rkmpp --enable-libdrm --enable-encoder=h264_rkmpp/hevc_rkmpp`
+# plus the librockchip_mpp system link. Needs the Rockchip BSP
+# `librockchip-mpp-dev` + `libdrm-dev` at build time and the MPP kernel
+# driver (`/dev/mpp_service`) at runtime. H.264/HEVC 8-bit 4:2:0 only.
+# Build on native aarch64 — there is no rockchip_mpp on x86_64.
+video-encoder-rkmpp = ["libffmpeg-video-sys/video-encoder-rkmpp"]
 # Hardware-decode features — symmetric with the encoder set above. Each
 # enables compiled-in support for one HW decoder family in
 # `VideoDecoder::open_with_backend`. Off by default so generic builds

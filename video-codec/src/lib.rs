@@ -310,6 +310,12 @@ pub enum VideoEncoderCodec {
     H264Vaapi,
     /// VAAPI HEVC hardware encoder (Linux; AMD/Intel via libva).
     HevcVaapi,
+    /// Rockchip MPP (RKMPP) H.264 hardware encoder (ARM Rockchip SoCs;
+    /// RK3568 / RK3588 / ...). 8-bit 4:2:0 only.
+    H264Rkmpp,
+    /// Rockchip MPP (RKMPP) HEVC hardware encoder (ARM Rockchip SoCs).
+    /// 8-bit 4:2:0 only — the Rockchip VEPU has no 10-bit encode path.
+    HevcRkmpp,
 }
 
 impl VideoEncoderCodec {
@@ -319,11 +325,13 @@ impl VideoEncoderCodec {
             VideoEncoderCodec::X264
             | VideoEncoderCodec::H264Nvenc
             | VideoEncoderCodec::H264Qsv
-            | VideoEncoderCodec::H264Vaapi => VideoCodec::H264,
+            | VideoEncoderCodec::H264Vaapi
+            | VideoEncoderCodec::H264Rkmpp => VideoCodec::H264,
             VideoEncoderCodec::X265
             | VideoEncoderCodec::HevcNvenc
             | VideoEncoderCodec::HevcQsv
-            | VideoEncoderCodec::HevcVaapi => VideoCodec::Hevc,
+            | VideoEncoderCodec::HevcVaapi
+            | VideoEncoderCodec::HevcRkmpp => VideoCodec::Hevc,
         }
     }
 
@@ -338,6 +346,8 @@ impl VideoEncoderCodec {
             VideoEncoderCodec::HevcQsv => "hevc_qsv",
             VideoEncoderCodec::H264Vaapi => "h264_vaapi",
             VideoEncoderCodec::HevcVaapi => "hevc_vaapi",
+            VideoEncoderCodec::H264Rkmpp => "h264_rkmpp",
+            VideoEncoderCodec::HevcRkmpp => "hevc_rkmpp",
         }
     }
 }

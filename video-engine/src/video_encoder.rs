@@ -303,6 +303,29 @@ impl VideoEncoder {
                     ));
                 }
             }
+            VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp => {
+                if !cfg!(feature = "video-encoder-rkmpp") {
+                    return Err(VideoEncoderError::EncoderDisabled(config.codec));
+                }
+                // Rockchip MPP H.264/HEVC encoders are 8-bit 4:2:0 ONLY.
+                // The RK3568 / RK3588 VEPU has no 4:2:2, no 4:4:4, and no
+                // 10-bit encode path (10-bit on RK3588 is a *decode*-only
+                // capability). Reject anything else up front so the operator
+                // gets a clear error instead of an opaque avcodec_open2
+                // EINVAL — this is also what keeps a 10-bit / 4:2:2 request
+                // from ever resolving to RKMPP on the edge auto-resolver.
+                if config.chroma != VideoChroma::Yuv420 {
+                    return Err(VideoEncoderError::InvalidInput(
+                        "RKMPP encode supports chroma=yuv420p only (the Rockchip VEPU is 4:2:0; use libx264/libx265 for 4:2:2 / 4:4:4)".into(),
+                    ));
+                }
+                if config.bit_depth != 8 {
+                    return Err(VideoEncoderError::InvalidInput(format!(
+                        "RKMPP encode supports bit_depth=8 only (the Rockchip VEPU has no 10-bit encode path; got {}-bit — use libx265 for 10-bit HEVC)",
+                        config.bit_depth,
+                    )));
+                }
+            }
         }
 
         if config.width == 0 || config.height == 0 {
@@ -431,6 +454,22 @@ impl VideoEncoder {
             );
             if is_qsv {
                 (*ctx).pix_fmt = qsv_pix_fmt_for(config.chroma, config.bit_depth);
+            }
+            // RKMPP feeds the same NV12 sysmem layout as QSV. FFmpeg's
+            // `h264_rkmpp` / `hevc_rkmpp` encoders advertise NV12 (and
+            // YUV420P) in their `pix_fmts`; when handed a plain sysmem NV12
+            // frame with no caller-supplied `hw_device_ctx`, the encoder
+            // auto-creates its own `AV_HWDEVICE_TYPE_RKMPP` device and copies
+            // the frame into an MPP/DRM buffer internally — so, exactly like
+            // QSV, we do NOT wire a `hw_frames_ctx` here. RKMPP is 8-bit
+            // 4:2:0 only (enforced at the top of `open()`), so NV12 is the
+            // only surface it ever needs.
+            let is_rkmpp = matches!(
+                config.codec,
+                VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp
+            );
+            if is_rkmpp {
+                (*ctx).pix_fmt = AVPixelFormat_AV_PIX_FMT_NV12;
             }
             // Effective QSV pipeline depth: 0 means "unset" and behaves
             // like 1 (synchronous). Clamp the top so a wild config value
@@ -952,6 +991,17 @@ impl VideoEncoder {
     /// different re-encoded input, the new input's encoder needs to emit a
     /// keyframe so downstream decoders can resync immediately instead of
     /// waiting up to a full GOP for the next natural IDR.
+    ///
+    /// **RKMPP limitation:** the Rockchip MPP encoders (`h264_rkmpp` /
+    /// `hevc_rkmpp`) do **not** honour `AVFrame.pict_type = AV_PICTURE_TYPE_I`
+    /// — upstream `rkmppenc.c` only *reads* `KEY_OUTPUT_INTRA` off the output
+    /// packet meta to tag keyframes; it exposes no input-side forced-IDR path
+    /// through avcodec (forcing an IDR needs the out-of-band MPP control call
+    /// `MPP_ENC_SET_IDR_FRAME`). So on RKMPP this is a silent no-op and an
+    /// input switch resyncs on the encoder's next GOP IDR rather than
+    /// immediately. Keep `gop_size` modest on Rockchip flows if fast
+    /// switch-in is required. Tracked as a follow-up (needs a vendored
+    /// rkmppenc patch, hardware-verified on an RK3568/RK3588 board).
     pub fn force_next_keyframe(&mut self) {
         self.force_idr_next = true;
     }
@@ -1008,7 +1058,13 @@ impl VideoEncoder {
         unsafe {
             if self.is_vaapi() {
                 self.encode_frame_vaapi(y, y_stride, u, u_stride, v, v_stride, hh, ww, pts)
-            } else if self.is_qsv() {
+            } else if self.is_qsv() || self.is_rkmpp() {
+                // RKMPP shares the QSV NV12 sysmem packer (Y plane copy +
+                // interleaved UV into `self.frame`). Its `qsv_ring` is empty
+                // (populated only for QSV pipelining), so the packer writes
+                // straight into `self.frame` — safe to reuse because the
+                // rkmpp encoder copies each submitted frame into its own MPP
+                // buffer (av_image_copy2) and holds no reference to ours.
                 self.encode_frame_qsv(y, y_stride, u, u_stride, v, v_stride, hh, ww, pts)
             } else {
                 self.encode_frame_sw(y, y_stride, u, u_stride, v, v_stride, hh, pts)
@@ -1032,6 +1088,17 @@ impl VideoEncoder {
         matches!(
             self.codec,
             VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv
+        )
+    }
+
+    /// True when this encoder is opened against an RKMPP (Rockchip MPP)
+    /// backend. Like QSV, RKMPP consumes NV12 sysmem frames (`data[0]` = Y,
+    /// `data[1]` = interleaved UV) and shares the `encode_frame_qsv` packer.
+    /// RKMPP is 8-bit 4:2:0 only, so the surface is always NV12.
+    fn is_rkmpp(&self) -> bool {
+        matches!(
+            self.codec,
+            VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp
         )
     }
 

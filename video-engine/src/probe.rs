@@ -515,22 +515,33 @@ impl ProbeChroma {
 ///   YUV422P10LE. Both software encoders accept the full matrix when
 ///   the matching profile is compiled in (the bilbycast-vendored
 ///   build has High10 / High422 / High444 / Main10 enabled).
+/// * **RKMPP (`h264_rkmpp` / `hevc_rkmpp`)** — NV12 (4:2:0 8-bit) only.
+///   The Rockchip VEPU has no 4:2:2, no 4:4:4, and no 10-bit encode
+///   path, so every other chroma/depth cell returns `None`.
 fn probe_pix_fmt_for_chroma(name: &str, chroma: ProbeChroma) -> Option<AVPixelFormat> {
     let lower = name.to_ascii_lowercase();
     let is_qsv = lower.contains("qsv");
     let is_nvenc = lower.contains("nvenc");
     let is_amf = lower.contains("amf");
+    // RKMPP (Rockchip MPP, `h264_rkmpp` / `hevc_rkmpp`) is 8-bit 4:2:0 ONLY
+    // and takes an NV12 sysmem frame (same as QSV) — no 4:2:2, no 10-bit on
+    // any current Rockchip SoC. Probed with NV12 at 4:2:0 8-bit; every other
+    // chroma/depth cell returns `None` (genuinely unsupported by the VPU).
+    let is_rkmpp = lower.contains("rkmpp");
     let is_h264 = lower.contains("h264") || lower == "libx264";
     let is_hevc = lower.contains("hevc") || lower.contains("h265") || lower == "libx265";
 
     match chroma {
-        ProbeChroma::Yuv420_8bit => Some(if is_qsv {
+        ProbeChroma::Yuv420_8bit => Some(if is_qsv || is_rkmpp {
             AVPixelFormat_AV_PIX_FMT_NV12
         } else {
             AVPixelFormat_AV_PIX_FMT_YUV420P
         }),
         ProbeChroma::Yuv422_8bit => {
-            if is_nvenc {
+            if is_rkmpp {
+                // RKMPP is 4:2:0 only — the Rockchip VEPU has no 4:2:2 path.
+                None
+            } else if is_nvenc {
                 // NVENC has no 4:2:2 path on any GPU generation. Skip
                 // the probe outright — reporting "not supported" without
                 // burning a session slot.
@@ -550,7 +561,12 @@ fn probe_pix_fmt_for_chroma(name: &str, chroma: ProbeChroma) -> Option<AVPixelFo
             }
         }
         ProbeChroma::Yuv420_10bit => {
-            if is_h264 && (is_nvenc || is_qsv || is_amf) {
+            if is_rkmpp {
+                // RKMPP has no 10-bit encode path (the RK3568/RK3588 VEPU
+                // is 8-bit; 10-bit on RK3588 is decode-only). Applies to
+                // both h264_rkmpp and hevc_rkmpp.
+                None
+            } else if is_h264 && (is_nvenc || is_qsv || is_amf) {
                 // H.264 has no Main10 profile on any HW backend. Skip.
                 None
             } else if is_qsv {
@@ -562,7 +578,9 @@ fn probe_pix_fmt_for_chroma(name: &str, chroma: ProbeChroma) -> Option<AVPixelFo
             }
         }
         ProbeChroma::Yuv422_10bit => {
-            if is_h264 && (is_nvenc || is_qsv || is_amf) {
+            if is_rkmpp {
+                None // RKMPP: neither 4:2:2 nor 10-bit
+            } else if is_h264 && (is_nvenc || is_qsv || is_amf) {
                 None
             } else if is_nvenc {
                 None // NVENC: no 4:2:2 at any depth
