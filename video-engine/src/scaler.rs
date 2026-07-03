@@ -11,6 +11,17 @@ use video_codec::{ScalerDstFormat, VideoError};
 
 use crate::decoder::DecodedFrame;
 
+/// libswscale Lanczos scaler flag (`SWS_LANCZOS`).
+///
+/// In FFmpeg 7.x this was a `#define` that bindgen lifted to a bare `u32`
+/// constant. FFmpeg 8.0 turned the `SWS_*` flags into an `enum SwsFlags`,
+/// whose variants our bindgen allowlist doesn't surface as bare constants.
+/// The value (`1 << 9`) is a stable ABI flag that has never changed, so we
+/// pin it locally — the same approach the crate already uses for other
+/// stable FFmpeg constants (`FF_QP2LAMBDA`, `AVERROR`, `FF_THREAD_*`). This
+/// keeps the scaler version-agnostic across the 7.1 → 8.1 bump.
+const SWS_LANCZOS: u32 = 1 << 9;
+
 /// A scaled video frame ready for encoding or packetization.
 ///
 /// Owns its pixel data buffer. Pixel format depends on the scaler's

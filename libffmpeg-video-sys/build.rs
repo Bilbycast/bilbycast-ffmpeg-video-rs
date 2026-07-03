@@ -181,11 +181,21 @@ fn main() {
         .allowlist_var("SWS_.*")
         .allowlist_var("AV_LOG_.*")
         .allowlist_var("AV_PKT_FLAG_.*")
+        // AVFrame.key_frame / .interlaced_frame / .top_field_first were removed
+        // in FFmpeg 8.0 (FF_API_FRAME_KEY / FF_API_INTERLACED_FRAME); the
+        // replacement is the AV_FRAME_FLAG_* bitmask on AVFrame.flags (present
+        // since 6.1, so this also works on the current n7.1.3 tree).
+        .allowlist_var("AV_FRAME_FLAG_.*")
         .allowlist_var("AVERROR.*")
         .allowlist_var("AV_INPUT_BUFFER_PADDING_SIZE")
         .allowlist_var("AV_CODEC_FLAG_.*")
         .allowlist_var("FF_COMPLIANCE_.*")
+        // FF_PROFILE_* was renamed to AV_PROFILE_* in FFmpeg 8.0
+        // (FF_API_FF_PROFILE_LEVEL). We set encoder profiles via string
+        // AVOptions, so neither symbol set is load-bearing — allowlist both
+        // so the build works across the 7.1 → 8.1 bump either way.
         .allowlist_var("FF_PROFILE_.*")
+        .allowlist_var("AV_PROFILE_.*")
         .derive_debug(true)
         .derive_copy(true)
         .derive_default(true)
@@ -333,7 +343,9 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--disable-avdevice".into(),
         "--disable-avformat".into(),
         "--disable-network".into(),
-        "--disable-postproc".into(),
+        // NOTE: --disable-postproc is added conditionally below — libpostproc
+        // was removed entirely in FFmpeg 8.0, so the option no longer exists
+        // there and configure hard-fails on it as unknown.
         "--disable-avfilter".into(),
         "--enable-avcodec".into(),
         "--enable-avutil".into(),
@@ -396,6 +408,14 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         "--disable-videotoolbox".into(),
     ];
 
+    // libpostproc was removed in FFmpeg 8.0. Only pass --disable-postproc on
+    // trees that still ship it (n7.1.x and earlier); on 8.x the option is
+    // unknown and configure aborts. Gate on the source tree so this build.rs
+    // works across the 7.1.3 → 8.1 submodule bump either way.
+    if source_abs.join("libpostproc").is_dir() {
+        configure_args.push("--disable-postproc".into());
+    }
+
     // libdrm: the bilbycast-edge `display` output drives KMS directly
     // via the `drm` Rust crate, so historically we disabled libdrm in
     // FFmpeg to avoid hwcontext_drm.o landing in libavutil and forcing
@@ -434,16 +454,22 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     // x86 assembly. The C-only fallback in libswscale (Lanczos / bilinear
     // YUV→YUV downscale) corrupts the chroma planes on x86_64 — every
     // thumbnail comes back with magenta-and-green stripe artifacts. So
-    // require nasm/yasm on x86_64 and enable assembly when present.
+    // require nasm on x86_64 and enable assembly when present.
     // On other architectures (ARM/AArch64), the C path is fine.
+    //
+    // NOTE: FFmpeg 8.0 dropped yasm support entirely — nasm is now mandatory
+    // for x86 assembly. A host that has yasm but not nasm would build fine on
+    // n7.1.3 but the 8.x configure now dies ("nasm not found or too old"). So
+    // we gate strictly on nasm and gracefully fall back to --disable-x86asm
+    // (correct, degraded) rather than letting configure fail.
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "x86" || target_arch == "x86_64" {
-        let have_asm = which("nasm") || which("yasm");
+        let have_asm = which("nasm");
         if have_asm {
             // Default behaviour — let configure auto-enable x86asm.
         } else {
             println!(
-                "cargo:warning=libffmpeg-video-sys: nasm/yasm not found on x86_64. The vendored FFmpeg will be built without x86 assembly, which causes libswscale to corrupt YUV downscale output (every thumbnail will come back with stripe artifacts). Install nasm: `sudo apt install nasm` (Debian/Ubuntu) or `brew install nasm` (macOS x86)."
+                "cargo:warning=libffmpeg-video-sys: nasm not found on x86_64 (FFmpeg 8.0+ requires nasm; yasm is no longer supported). The vendored FFmpeg will be built without x86 assembly, which causes libswscale to corrupt YUV downscale output (every thumbnail will come back with stripe artifacts). Install nasm: `sudo apt install nasm` (Debian/Ubuntu) or `brew install nasm` (macOS x86)."
             );
             configure_args.push("--disable-x86asm".into());
         }

@@ -144,8 +144,12 @@ impl DecodedFrame {
     }
 
     /// Whether this frame is a keyframe.
+    ///
+    /// Reads the `AV_FRAME_FLAG_KEY` bit on `AVFrame.flags` rather than the
+    /// legacy `AVFrame.key_frame` int, which was removed in FFmpeg 8.0. The
+    /// flag is set by decoders since 6.1, so this is correct on n7.1.3 too.
     pub fn is_keyframe(&self) -> bool {
-        unsafe { (*self.frame).key_frame != 0 }
+        unsafe { ((*self.frame).flags & AV_FRAME_FLAG_KEY as i32) != 0 }
     }
 
     /// Per-frame PTS in the timebase the caller supplied to
@@ -544,7 +548,11 @@ impl DecodedFrame {
             (*dst).color_range = (*self.frame).color_range;
             (*dst).color_trc = (*self.frame).color_trc;
             (*dst).color_primaries = (*self.frame).color_primaries;
-            (*dst).key_frame = (*self.frame).key_frame;
+            // Propagate the keyframe marker via the AV_FRAME_FLAG_KEY bit
+            // (AVFrame.key_frame was removed in FFmpeg 8.0).
+            if ((*self.frame).flags & AV_FRAME_FLAG_KEY as i32) != 0 {
+                (*dst).flags |= AV_FRAME_FLAG_KEY as i32;
+            }
             Ok(DecodedFrame { frame: dst })
         }
     }
