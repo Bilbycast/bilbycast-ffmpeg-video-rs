@@ -451,7 +451,17 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
 
     // Aggregated pkg-config search path so FFmpeg's configure can find
     // every enabled optional library at once.
+    //
+    // Seed with the caller's PKG_CONFIG_PATH. The `pkg_config` probes below
+    // honour that variable, so omitting it here lets a dependency look present
+    // to us and missing to FFmpeg's own configure — which is exactly what
+    // happens with a header-only .pc such as ffnvcodec installed to a custom
+    // prefix: it contributes no `link_paths`, so nothing re-adds its directory.
     let mut pkgconfig_paths: Vec<PathBuf> = vec![opus_pkgconfig.clone()];
+    if let Some(inherited) = std::env::var_os("PKG_CONFIG_PATH") {
+        println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+        pkgconfig_paths.extend(std::env::split_paths(&inherited));
+    }
 
     let gpl_required = cfg!(feature = "video-encoder-x264")
         || cfg!(feature = "video-encoder-x265");
