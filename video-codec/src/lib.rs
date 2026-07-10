@@ -348,8 +348,15 @@ impl std::fmt::Display for VideoEncoderCodec {
     }
 }
 
-/// Encoder speed / quality preset. Semantics mirror libx264/x265 presets;
-/// NVENC maps them onto the nearest equivalent `-preset` internally.
+/// Encoder speed / quality preset. Semantics mirror libx264/x265 presets.
+///
+/// **These names are NOT universally accepted.** An earlier version of this
+/// doc claimed NVENC maps them internally — hardware says otherwise: NVENC's
+/// named presets are only `slow` / `medium` / `fast` (plus `p1`–`p7`), and
+/// handing it `ultrafast` makes `avcodec_open2` fail with `EINVAL (-22)`.
+/// QSV rejects `ultrafast` / `superfast` likewise. Callers targeting a
+/// hardware backend must map to a name it accepts first (bilbycast-edge does
+/// this in `video_encode_util::sanitise_preset`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoPreset {
     Ultrafast,
