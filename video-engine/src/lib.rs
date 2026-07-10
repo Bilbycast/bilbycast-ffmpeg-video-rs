@@ -76,3 +76,121 @@ pub fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
         || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV444P10LE
         || av_pix_fmt == AVPixelFormat_AV_PIX_FMT_YUV444P12LE
 }
+
+/// The `(chroma, bit_depth)` a planar YUV `AVPixelFormat` actually carries,
+/// or `None` for non-planar / hardware / unsupported formats.
+///
+/// The inverse of [`av_pix_fmt_for_yuv`], and the piece
+/// [`is_planar_yuv_av_pix_fmt`] cannot express: knowing a source is *some*
+/// planar YUV says nothing about whether its plane layout matches the
+/// encoder's. A 4:2:2 source fed to a 4:2:0 encoder has the right number of
+/// planes and the wrong number of chroma rows, so the encoder reads chroma
+/// from the wrong lines — perfect luma, ghosted colour. Callers need this to
+/// decide whether a libswscale conversion is genuinely unnecessary.
+///
+/// The full-range `YUVJ*` variants report the same layout as their limited-
+/// range counterparts: they differ in colour range, not in plane geometry, and
+/// the encoder's `color_range` carries that separately.
+pub fn planar_yuv_layout(av_pix_fmt: i32) -> Option<(video_codec::VideoChroma, u8)> {
+    use libffmpeg_video_sys::*;
+    use video_codec::VideoChroma;
+
+    let f = av_pix_fmt;
+    if f == AVPixelFormat_AV_PIX_FMT_YUV420P || f == AVPixelFormat_AV_PIX_FMT_YUVJ420P {
+        Some((VideoChroma::Yuv420, 8))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+        Some((VideoChroma::Yuv420, 10))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV420P12LE {
+        Some((VideoChroma::Yuv420, 12))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV422P || f == AVPixelFormat_AV_PIX_FMT_YUVJ422P {
+        Some((VideoChroma::Yuv422, 8))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV422P10LE {
+        Some((VideoChroma::Yuv422, 10))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV422P12LE {
+        Some((VideoChroma::Yuv422, 12))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV444P || f == AVPixelFormat_AV_PIX_FMT_YUVJ444P {
+        Some((VideoChroma::Yuv444, 8))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV444P10LE {
+        Some((VideoChroma::Yuv444, 10))
+    } else if f == AVPixelFormat_AV_PIX_FMT_YUV444P12LE {
+        Some((VideoChroma::Yuv444, 12))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod planar_layout_tests {
+    use super::{is_planar_yuv_av_pix_fmt, planar_yuv_layout};
+    use video_codec::VideoChroma;
+
+    /// Every format `is_planar_yuv_av_pix_fmt` accepts must have a known
+    /// layout, otherwise a caller that trusts the former gets `None` from the
+    /// latter and has no way to decide about conversion.
+    #[test]
+    fn layout_is_known_for_every_planar_format() {
+        use libffmpeg_video_sys::*;
+        for f in [
+            AVPixelFormat_AV_PIX_FMT_YUV420P,
+            AVPixelFormat_AV_PIX_FMT_YUVJ420P,
+            AVPixelFormat_AV_PIX_FMT_YUV420P10LE,
+            AVPixelFormat_AV_PIX_FMT_YUV420P12LE,
+            AVPixelFormat_AV_PIX_FMT_YUV422P,
+            AVPixelFormat_AV_PIX_FMT_YUVJ422P,
+            AVPixelFormat_AV_PIX_FMT_YUV422P10LE,
+            AVPixelFormat_AV_PIX_FMT_YUV422P12LE,
+            AVPixelFormat_AV_PIX_FMT_YUV444P,
+            AVPixelFormat_AV_PIX_FMT_YUVJ444P,
+            AVPixelFormat_AV_PIX_FMT_YUV444P10LE,
+            AVPixelFormat_AV_PIX_FMT_YUV444P12LE,
+        ] {
+            assert!(is_planar_yuv_av_pix_fmt(f), "fixture must be planar: {f}");
+            assert!(planar_yuv_layout(f).is_some(), "layout unknown for {f}");
+        }
+    }
+
+    /// Full-range J variants differ in colour range, not plane geometry.
+    #[test]
+    fn j_variants_report_the_same_geometry() {
+        use libffmpeg_video_sys::*;
+        assert_eq!(
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUVJ420P),
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUV420P),
+        );
+        assert_eq!(
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUVJ422P),
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUV422P),
+        );
+    }
+
+    /// Round-trips against `av_pix_fmt_for_yuv` for the pairs it supports.
+    #[test]
+    fn inverts_av_pix_fmt_for_yuv() {
+        for (chroma, depth) in [
+            (VideoChroma::Yuv420, 8),
+            (VideoChroma::Yuv420, 10),
+            (VideoChroma::Yuv422, 8),
+            (VideoChroma::Yuv422, 10),
+        ] {
+            let f = super::av_pix_fmt_for_yuv(chroma, depth).expect("supported pair");
+            assert_eq!(planar_yuv_layout(f), Some((chroma, depth)));
+        }
+    }
+
+    /// 4:2:2 and 4:2:0 must never compare equal — the whole point.
+    #[test]
+    fn distinguishes_422_from_420() {
+        use libffmpeg_video_sys::*;
+        assert_ne!(
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUV422P),
+            planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_YUV420P),
+        );
+    }
+
+    #[test]
+    fn non_planar_has_no_layout() {
+        use libffmpeg_video_sys::*;
+        assert_eq!(planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_NV12), None);
+        assert_eq!(planar_yuv_layout(AVPixelFormat_AV_PIX_FMT_BGRA), None);
+    }
+}
