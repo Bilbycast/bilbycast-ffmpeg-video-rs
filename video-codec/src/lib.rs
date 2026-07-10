@@ -501,6 +501,25 @@ pub struct VideoEncoderConfig {
     pub fps_num: u32,
     /// Frame rate denominator (e.g. 1001 for 29.97 fps).
     pub fps_den: u32,
+    /// Timebase of the `pts` values the caller will pass to `encode_frame`,
+    /// as `num / den` seconds per tick. **`0 / 0` (the default) derives
+    /// `1 / fps`** — one tick per frame, the historical contract used by the
+    /// transcode call sites that feed a frame counter.
+    ///
+    /// Callers whose timestamps are natively 90 kHz (MPEG-TS ingest paths:
+    /// SDI, ST 2110-20/-23) must set `1 / 90000` instead. Feeding 90 kHz
+    /// ticks into a `1 / fps` timebase tells the encoder's rate control that
+    /// frames are minutes apart; libx264's VBV then overflows internally and
+    /// **segfaults** (observed: `movups` through a wild pointer ~2 GiB from
+    /// the frame buffer, ~1 lookahead-depth of frames after open). This is
+    /// unguardable from our side of the FFI, so getting the declared
+    /// timebase right is load-bearing, not cosmetic.
+    ///
+    /// The encoder's `framerate` is always declared from `fps_num / fps_den`
+    /// regardless, so rate control knows the true frame cadence either way.
+    pub time_base_num: u32,
+    /// See [`Self::time_base_num`].
+    pub time_base_den: u32,
     /// Target average bitrate in kbps. Ignored in `Crf` rate-control mode.
     pub bitrate_kbps: u32,
     /// Maximum bitrate cap in kbps for VBR (`rc_max_rate`). `0` means
@@ -570,6 +589,8 @@ impl Default for VideoEncoderConfig {
             height: 720,
             fps_num: 30,
             fps_den: 1,
+            time_base_num: 0,
+            time_base_den: 0,
             bitrate_kbps: 4000,
             max_bitrate_kbps: 0,
             gop_size: 60,
