@@ -79,7 +79,16 @@ pub enum PixelFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalerDstFormat {
     /// Planar YUV 4:2:0, full-range. Existing default (MJPEG-compatible).
+    ///
+    /// **Not** the right target for a video-encoder feed: libswscale range-
+    /// expands limited-range source samples on the way to a `J` format, while
+    /// the encoder is opened as `AV_PIX_FMT_YUV420P`, so the stream ends up
+    /// carrying full-range samples but signalling limited range. Use
+    /// [`Self::Yuv420p8`] for encoder input; keep this for MJPEG / thumbnails.
     Yuvj420p,
+    /// Planar YUV 4:2:0, 8-bit, broadcast (limited) range. The correct 4:2:0
+    /// target for an encoder feed.
+    Yuv420p8,
     /// Planar YUV 4:2:2, 8-bit. Broadcast-range.
     Yuv422p8,
     /// Planar YUV 4:2:2, 10-bit little-endian. Broadcast 10-bit.
