@@ -410,9 +410,23 @@ impl VideoEncoder {
             (*ctx).width = config.width as i32;
             (*ctx).height = config.height as i32;
             (*ctx).pix_fmt = pix_fmt;
-            // time_base = 1 / fps (single tick per frame in the encoder clock)
-            (*ctx).time_base.num = config.fps_den as i32;
-            (*ctx).time_base.den = config.fps_num as i32;
+            // The declared time_base MUST match the units of the pts values
+            // the caller feeds `encode_frame` — libx264's VBV rate control
+            // does real arithmetic on pts deltas and segfaults when they are
+            // wildly larger than a frame duration (90 kHz ticks read against
+            // a 1/fps timebase = "frames minutes apart"). Default (0/0) is
+            // the historical 1/fps frame-counter contract; 90 kHz ingest
+            // paths declare 1/90000. See `VideoEncoderConfig::time_base_num`.
+            if config.time_base_num != 0 && config.time_base_den != 0 {
+                (*ctx).time_base.num = config.time_base_num as i32;
+                (*ctx).time_base.den = config.time_base_den as i32;
+            } else {
+                // time_base = 1 / fps (single tick per frame)
+                (*ctx).time_base.num = config.fps_den as i32;
+                (*ctx).time_base.den = config.fps_num as i32;
+            }
+            // `framerate` carries the true frame cadence independently of the
+            // pts timebase, so rate control is correct in both modes.
             (*ctx).framerate.num = config.fps_num as i32;
             (*ctx).framerate.den = config.fps_den as i32;
             (*ctx).gop_size = config.gop_size as i32;
@@ -1711,6 +1725,8 @@ mod tests {
             height: 240,
             fps_num: 50,
             fps_den: 1,
+            time_base_num: 0,
+            time_base_den: 0,
             bitrate_kbps: 1000,
             gop_size: 25,
             async_depth: 4,
@@ -1789,6 +1805,8 @@ mod tests {
                 height: H as u32,
                 fps_num: 50,
                 fps_den: 1,
+                time_base_num: 0,
+                time_base_den: 0,
                 bitrate_kbps: 40_000,
                 gop_size: 50,
                 async_depth: depth,
@@ -1841,6 +1859,8 @@ mod tests {
             height: 240,
             fps_num: 25,
             fps_den: 1,
+            time_base_num: 0,
+            time_base_den: 0,
             bitrate_kbps: 500,
             gop_size: 25,
             ..Default::default()
