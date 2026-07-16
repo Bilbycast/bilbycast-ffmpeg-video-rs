@@ -152,6 +152,26 @@ impl DecodedFrame {
         unsafe { ((*self.frame).flags & AV_FRAME_FLAG_KEY as i32) != 0 }
     }
 
+    /// Whether the decoder marked this frame's content as interlaced
+    /// (two temporally distinct fields weaved into one frame).
+    ///
+    /// Reads the `AV_FRAME_FLAG_INTERLACED` bit on `AVFrame.flags` —
+    /// the replacement for the legacy `AVFrame.interlaced_frame` int
+    /// (deprecated in 6.1, removed in FFmpeg 8.0). Consumers that
+    /// render frames to a progressive surface (the bilbycast-edge
+    /// local-display output) use this to engage a deinterlacer instead
+    /// of scanning out weaved fields with comb artifacts.
+    pub fn is_interlaced(&self) -> bool {
+        unsafe { ((*self.frame).flags & AV_FRAME_FLAG_INTERLACED as i32) != 0 }
+    }
+
+    /// For interlaced content, `true` when the top field is temporally
+    /// first (`AV_FRAME_FLAG_TOP_FIELD_FIRST`). Meaningless when
+    /// [`is_interlaced`](Self::is_interlaced) is `false`.
+    pub fn top_field_first(&self) -> bool {
+        unsafe { ((*self.frame).flags & AV_FRAME_FLAG_TOP_FIELD_FIRST as i32) != 0 }
+    }
+
     /// Per-frame PTS in the timebase the caller supplied to
     /// [`VideoDecoder::send_packet_with_pts`]. FFmpeg propagates the
     /// input packet's PTS through the decoder's internal reorder
@@ -549,10 +569,13 @@ impl DecodedFrame {
             (*dst).color_trc = (*self.frame).color_trc;
             (*dst).color_primaries = (*self.frame).color_primaries;
             // Propagate the keyframe marker via the AV_FRAME_FLAG_KEY bit
-            // (AVFrame.key_frame was removed in FFmpeg 8.0).
-            if ((*self.frame).flags & AV_FRAME_FLAG_KEY as i32) != 0 {
-                (*dst).flags |= AV_FRAME_FLAG_KEY as i32;
-            }
+            // (AVFrame.key_frame was removed in FFmpeg 8.0), and the
+            // interlace markers — the display path's deinterlace
+            // decision runs on the downloaded frame.
+            let carried = (AV_FRAME_FLAG_KEY
+                | AV_FRAME_FLAG_INTERLACED
+                | AV_FRAME_FLAG_TOP_FIELD_FIRST) as i32;
+            (*dst).flags |= (*self.frame).flags & carried;
             Ok(DecodedFrame { frame: dst })
         }
     }
