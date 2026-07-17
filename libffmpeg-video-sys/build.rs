@@ -743,6 +743,13 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             extra_ldflags.push_str(&format!("-L{}", lp.display()));
             pkgconfig_paths.push(lp.join("pkgconfig"));
         }
+        // FFmpeg classifies the Rockchip MPP wrapper as a `version3` external
+        // library, so `--enable-rkmpp` hard-requires `--enable-version3` —
+        // configure aborts otherwise ("rkmpp is version3 and --enable-version3
+        // is not specified"). License-compatible: the rockchip artefact is
+        // already AGPL-3.0-or-later via `--enable-gpl`, and version3
+        // ((L)GPLv3) relicensing is subsumed by AGPL-3.0.
+        configure_args.push("--enable-version3".into());
         configure_args.push("--enable-rkmpp".into());
         configure_args.push("--enable-encoder=h264_rkmpp".into());
         configure_args.push("--enable-encoder=hevc_rkmpp".into());
