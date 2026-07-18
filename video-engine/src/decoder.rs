@@ -652,6 +652,21 @@ pub struct VideoDecoder {
     /// display output's resolver tag stats with the right kind without
     /// re-deriving from the codec name.
     backend: DecoderBackend,
+    /// Wall-clock duration of the most recent `avcodec_receive_frame`
+    /// call, in microseconds — the raw decoder-library frame fetch,
+    /// excluding [`Self::last_transfer_us`] below. Diagnostic-only
+    /// (isolates decode-library cost from our own post-processing when
+    /// investigating stutter reports); overwritten every call.
+    last_receive_frame_us: u64,
+    /// Wall-clock duration of the most recent RKMPP DRM_PRIME→sysmem
+    /// `av_hwframe_transfer_data` call, in microseconds. `None` when
+    /// the last `receive_frame()` call didn't hit that path (every
+    /// backend except `Rkmpp`, or no frame was available). Diagnostic
+    /// companion to `last_receive_frame_us` — separates "MPP itself
+    /// was slow to hand back a frame" from "our sysmem download was
+    /// slow", which the combined `decode_us_max` stat in bilbycast-edge
+    /// can't distinguish on its own.
+    last_transfer_us: Option<u64>,
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -796,6 +811,8 @@ impl VideoDecoder {
                 codec,
                 vaapi_device,
                 backend,
+                last_receive_frame_us: 0,
+                last_transfer_us: None,
             })
         }
     }
@@ -875,13 +892,16 @@ impl VideoDecoder {
     /// packets before it can produce a frame. Returns `Err(VideoError::Eof)`
     /// when the stream has been fully drained after a flush.
     pub fn receive_frame(&mut self) -> Result<DecodedFrame, VideoError> {
+        self.last_transfer_us = None;
         unsafe {
             let frame = av_frame_alloc();
             if frame.is_null() {
                 return Err(VideoError::AllocFrame);
             }
 
+            let receive_start = std::time::Instant::now();
             let ret = avcodec_receive_frame(self.ctx, frame);
+            self.last_receive_frame_us = receive_start.elapsed().as_micros() as u64;
             if ret < 0 {
                 av_frame_free(&mut { frame });
                 if ret == AVERROR_EAGAIN {
@@ -917,7 +937,9 @@ impl VideoDecoder {
                     return Err(VideoError::AllocFrame);
                 }
                 (*dst).format = AVPixelFormat_AV_PIX_FMT_NONE;
+                let transfer_start = std::time::Instant::now();
                 let xfer_ret = av_hwframe_transfer_data(dst, frame, 0);
+                self.last_transfer_us = Some(transfer_start.elapsed().as_micros() as u64);
                 if xfer_ret < 0 {
                     av_frame_free(&mut { frame });
                     let mut tmp = dst;
@@ -940,6 +962,21 @@ impl VideoDecoder {
 
             Ok(DecodedFrame { frame })
         }
+    }
+
+    /// Wall-clock duration of the most recent `avcodec_receive_frame`
+    /// call, in microseconds. Diagnostic accessor — see the field doc
+    /// on [`Self::last_receive_frame_us`] for what it isolates.
+    pub fn last_receive_frame_us(&self) -> u64 {
+        self.last_receive_frame_us
+    }
+
+    /// Wall-clock duration of the most recent RKMPP DRM_PRIME→sysmem
+    /// transfer, in microseconds. `None` when the last `receive_frame()`
+    /// call didn't take that path. Diagnostic accessor — see the field
+    /// doc on [`Self::last_transfer_us`] for what it isolates.
+    pub fn last_transfer_us(&self) -> Option<u64> {
+        self.last_transfer_us
     }
 
     /// Reset the decoder state. Use after seeking or stream discontinuity.
