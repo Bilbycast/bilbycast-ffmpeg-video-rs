@@ -16,7 +16,8 @@ use libffmpeg_video_sys::*;
 use video_codec::{VideoCodec, VideoError};
 
 use crate::vaapi::{
-    map_vaapi_to_drm_prime, vaapi_get_format_callback, DrmPrimeFrame, VaapiDevice,
+    map_vaapi_to_drm_prime, vaapi_get_format_callback, wrap_rkmpp_drm_prime, DrmPrimeFrame,
+    VaapiDevice,
 };
 
 /// Decoder backend — selects which FFmpeg decoder family `VideoDecoder`
@@ -28,10 +29,13 @@ use crate::vaapi::{
 /// satisfy the request.
 ///
 /// HW frames come back in NV12 system memory by default — the cuvid /
-/// QSV / rkmpp decoders auto-download to host memory via FFmpeg's
-/// built-in hwframe transfer. Callers pick up the layout via
-/// [`DecodedFrame::pixel_format`] and either use [`DecodedFrame::yuv_planes`]
-/// (planar YUV) or [`DecodedFrame::nv12_planes`] (semi-planar NV12).
+/// QSV decoders auto-download to host memory via FFmpeg's built-in
+/// hwframe transfer, and `rkmpp` does the equivalent explicitly inside
+/// [`VideoDecoder::receive_frame`] (its native output is
+/// `AV_PIX_FMT_DRM_PRIME`, not sysmem — see [`DecoderBackend::Rkmpp`]).
+/// Callers pick up the layout via [`DecodedFrame::pixel_format`] and
+/// either use [`DecodedFrame::yuv_planes`] (planar YUV) or
+/// [`DecodedFrame::nv12_planes`] (semi-planar NV12).
 ///
 /// `Vaapi` opens the codec against an `AVHWDeviceContext` of type
 /// `AV_HWDEVICE_TYPE_VAAPI` (default render node `/dev/dri/renderD128`)
@@ -56,9 +60,16 @@ pub enum DecoderBackend {
     Vaapi,
     /// Rockchip MPP via `h264_rkmpp` / `hevc_rkmpp`. Needs the
     /// `video-decoder-rkmpp` Cargo feature. ARM Rockchip (RK3568/RK3588)
-    /// only. Like NVDEC/QSV — a plain named decoder, NV12 system memory
-    /// output, no `AVHWDeviceContext`/`get_format` setup. No MPEG-2
-    /// decoder exists upstream for this backend.
+    /// only. A plain named decoder like NVDEC/QSV (no
+    /// `AVHWDeviceContext`/`get_format` setup at open time) but unlike
+    /// them it natively emits `AV_PIX_FMT_DRM_PRIME` frames, not sysmem
+    /// NV12 — `receive_frame()` downloads to sysmem by default so this
+    /// backend behaves like NVDEC/QSV from the caller's POV, unless the
+    /// caller opts in to the raw DRM_PRIME frames via
+    /// [`VideoDecoder::set_rkmpp_zero_copy`] for zero-copy KMS scanout
+    /// (mirrors [`DecoderBackend::Vaapi`]'s always-hardware-frame
+    /// default, just inverted). No MPEG-2 decoder exists upstream for
+    /// this backend.
     Rkmpp,
 }
 
@@ -501,53 +512,97 @@ impl DecodedFrame {
         self.pixel_format() == AVPixelFormat_AV_PIX_FMT_VAAPI
     }
 
-    /// Map a VAAPI HW surface to a DRM PRIME descriptor for zero-copy
-    /// KMS scanout. Returns the DMA-BUF fd, fourcc, modifier, dimensions
-    /// and per-plane offsets/strides plus an Arc-shared keepalive on the
-    /// underlying VAAPI frame — the caller hands the keepalive to the
-    /// page-flip loop and releases it only after the kernel posts
-    /// `DRM_EVENT_FLIP_COMPLETE`. Releasing earlier hands the surface
-    /// back to the VAAPI pool while it's still being scanned out, which
-    /// reads as tearing or a stuck frame on the HDMI output.
-    ///
-    /// Returns `Err(VideoError::HwFrameNotOnDevice)` when called on a
-    /// non-VAAPI frame; `Err(VideoError::HwFrameMap(_))` when the
-    /// libavutil DRM PRIME mapping path is unavailable (e.g. FFmpeg
-    /// built without `CONFIG_LIBDRM`) or the driver refused to export
-    /// this particular surface.
-    pub fn map_drm_prime(&self) -> Result<DrmPrimeFrame, VideoError> {
-        // SAFETY: `self.frame` is owned by `DecodedFrame` and lives at
-        // least until this method returns — `av_hwframe_map` clones the
-        // reference internally, so the resulting `DrmPrimeFrame` no
-        // longer depends on `self.frame` after this call.
-        unsafe { map_vaapi_to_drm_prime(self.frame as *const _) }
+    /// `true` when this is RKMPP's native hardware frame —
+    /// `format == AV_PIX_FMT_DRM_PRIME` straight out of
+    /// `avcodec_receive_frame`. Only reachable when the decoder was
+    /// opened with [`DecoderBackend::Rkmpp`] AND
+    /// [`VideoDecoder::set_rkmpp_zero_copy`] was enabled — otherwise
+    /// `receive_frame()` auto-downloads RKMPP frames to sysmem NV12 and
+    /// this always returns `false`. The system-memory plane accessors
+    /// all return `None` for these; use [`Self::map_drm_prime`] to
+    /// export the frame as a DMA-BUF for KMS scanout, exactly like
+    /// [`Self::is_vaapi`] frames.
+    pub fn is_drm_prime(&self) -> bool {
+        self.pixel_format() == AVPixelFormat_AV_PIX_FMT_DRM_PRIME
     }
 
-    /// Download a VAAPI HW frame to system memory. Allocates a fresh
-    /// `AVFrame`, calls `av_hwframe_transfer_data` to copy the GPU
-    /// surface into sysmem (FFmpeg picks the best sysmem format —
+    /// Map a VAAPI HW surface, or an RKMPP native DRM_PRIME frame, to a
+    /// DRM PRIME descriptor for zero-copy KMS scanout. Returns the
+    /// DMA-BUF fd, fourcc, modifier, dimensions and per-plane
+    /// offsets/strides plus an Arc-shared keepalive on the underlying
+    /// frame — the caller hands the keepalive to the page-flip loop and
+    /// releases it only after the kernel posts `DRM_EVENT_FLIP_COMPLETE`.
+    /// Releasing earlier hands the surface back to the decoder's pool
+    /// while it's still being scanned out, which reads as tearing or a
+    /// stuck frame on the HDMI output.
+    ///
+    /// Returns `Err(VideoError::HwFrameNotOnDevice)` when called on a
+    /// frame that's neither VAAPI nor RKMPP DRM_PRIME;
+    /// `Err(VideoError::HwFrameMap(_))` when the libavutil DRM PRIME
+    /// mapping path is unavailable (e.g. FFmpeg built without
+    /// `CONFIG_LIBDRM`) or the driver refused to export this particular
+    /// surface/descriptor.
+    pub fn map_drm_prime(&self) -> Result<DrmPrimeFrame, VideoError> {
+        unsafe {
+            if self.is_vaapi() {
+                // SAFETY: `self.frame` is owned by `DecodedFrame` and
+                // lives at least until this method returns —
+                // `av_hwframe_map` clones the reference internally, so
+                // the resulting `DrmPrimeFrame` no longer depends on
+                // `self.frame` after this call.
+                return map_vaapi_to_drm_prime(self.frame as *const _);
+            }
+            if self.is_drm_prime() {
+                // RKMPP's frame IS the DRM_PRIME frame (no separate
+                // mapped copy like VAAPI's `av_hwframe_map` produces),
+                // so build an independently-owned reference first via
+                // `av_frame_alloc` + `av_frame_ref` (bumps the
+                // underlying AVBufferRef refcount rather than copying
+                // pixel data) — `wrap_rkmpp_drm_prime` takes ownership
+                // of what it's given and `self.frame` must stay valid
+                // for this `DecodedFrame`'s own `Drop`.
+                let cloned = av_frame_alloc();
+                if cloned.is_null() {
+                    return Err(VideoError::AllocFrame);
+                }
+                let ret = av_frame_ref(cloned, self.frame);
+                if ret < 0 {
+                    let mut tmp = cloned;
+                    av_frame_free(&mut tmp);
+                    return Err(VideoError::HwFrameMap(ret));
+                }
+                return wrap_rkmpp_drm_prime(cloned);
+            }
+            Err(VideoError::HwFrameNotOnDevice)
+        }
+    }
+
+    /// Download a VAAPI or RKMPP HW frame to system memory. Allocates a
+    /// fresh `AVFrame`, calls `av_hwframe_transfer_data` to copy the GPU
+    /// / VPU surface into sysmem (FFmpeg picks the best sysmem format —
     /// NV12 for 8-bit YUV 4:2:0, P010LE for 10-bit), and returns a
-    /// new `DecodedFrame` whose `is_vaapi()` is `false` and whose
-    /// semi-planar accessors return `Some`. The caller's existing
-    /// SW-decoded codepath (libswscale + tonemap LUT etc.) then runs
-    /// unchanged.
+    /// new `DecodedFrame` whose `is_vaapi()`/`is_drm_prime()` are both
+    /// `false` and whose semi-planar accessors return `Some`. The
+    /// caller's existing SW-decoded codepath (libswscale + tonemap LUT
+    /// etc.) then runs unchanged.
     ///
-    /// Use case: HDR sources on SDR panels via the local-display
-    /// output. The KMS zero-copy scanout path can't apply the PQ/HLG
-    /// → SDR tonemap LUT — only the CPU-blit + `apply_bgra` path
-    /// does. When the source's `color_transfer()` is
-    /// `AVCOL_TRC_SMPTE2084` (PQ) or `AVCOL_TRC_ARIB_STD_B67` (HLG)
-    /// we trade one PCIe download per frame for visually correct
-    /// output. On AMD radeonsi the VAAPI surface already lives in
-    /// system memory so the transfer is effectively a pointer alias;
-    /// on Intel iHD it's a real DMA.
+    /// Use cases: HDR sources on SDR panels via the local-display
+    /// output (the KMS zero-copy scanout path can't apply the PQ/HLG
+    /// → SDR tonemap LUT — only the CPU-blit + `apply_bgra` path does),
+    /// bob-deinterlacing an interlaced source, or the kernel rejecting
+    /// a zero-copy PRIME framebuffer import. When the source's
+    /// `color_transfer()` is `AVCOL_TRC_SMPTE2084` (PQ) or
+    /// `AVCOL_TRC_ARIB_STD_B67` (HLG) we trade one download per frame
+    /// for visually correct output. On AMD radeonsi / RKMPP the surface
+    /// may already live in system memory so the transfer is effectively
+    /// a pointer alias; on Intel iHD it's a real DMA.
     ///
-    /// Returns `Err(VideoError::HwFrameNotOnDevice)` for non-VAAPI
-    /// frames, `Err(VideoError::AllocFrame)` on AVFrame alloc, and
-    /// `Err(VideoError::HwFrameMap(_))` when the transfer ioctl
-    /// failed (driver / format mismatch).
+    /// Returns `Err(VideoError::HwFrameNotOnDevice)` for a frame that's
+    /// neither VAAPI nor RKMPP DRM_PRIME, `Err(VideoError::AllocFrame)`
+    /// on AVFrame alloc, and `Err(VideoError::HwFrameMap(_))` when the
+    /// transfer ioctl failed (driver / format mismatch).
     pub fn download_to_sysmem(&self) -> Result<DecodedFrame, VideoError> {
-        if !self.is_vaapi() {
+        if !self.is_vaapi() && !self.is_drm_prime() {
             return Err(VideoError::HwFrameNotOnDevice);
         }
         unsafe {
@@ -667,6 +722,17 @@ pub struct VideoDecoder {
     /// slow", which the combined `decode_us_max` stat in bilbycast-edge
     /// can't distinguish on its own.
     last_transfer_us: Option<u64>,
+    /// When `true` (only meaningful for `DecoderBackend::Rkmpp`),
+    /// `receive_frame()` returns the raw `AV_PIX_FMT_DRM_PRIME` frame
+    /// straight from MPP instead of auto-downloading it to sysmem NV12.
+    /// Set via [`Self::set_rkmpp_zero_copy`] by callers that consume
+    /// the frame through [`DecodedFrame::map_drm_prime`] for zero-copy
+    /// KMS scanout (the local-display output). Every other RKMPP
+    /// consumer (transcode re-encode via `ts_video_replace`) needs
+    /// real sysmem pixel data and must leave this at its `false`
+    /// default, matching this module's documented sysmem-producer
+    /// contract for `DecoderBackend::Rkmpp`.
+    rkmpp_zero_copy: bool,
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -813,6 +879,7 @@ impl VideoDecoder {
                 backend,
                 last_receive_frame_us: 0,
                 last_transfer_us: None,
+                rkmpp_zero_copy: false,
             })
         }
     }
@@ -823,6 +890,18 @@ impl VideoDecoder {
     /// name.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// Opt in to zero-copy RKMPP display output: `receive_frame()`
+    /// returns the raw `AV_PIX_FMT_DRM_PRIME` frame instead of
+    /// auto-downloading it to sysmem NV12. Only meaningful when this
+    /// decoder was opened with [`DecoderBackend::Rkmpp`] — a no-op
+    /// otherwise. Callers pass the returned frame to
+    /// [`DecodedFrame::map_drm_prime`] for KMS scanout; every other
+    /// consumer of an RKMPP decoder (transcode re-encode) must leave
+    /// this at its `false` default so `nv12_planes()` keeps working.
+    pub fn set_rkmpp_zero_copy(&mut self, zero_copy: bool) {
+        self.rkmpp_zero_copy = zero_copy;
     }
 
     /// Send a packet of compressed video data to the decoder.
@@ -919,45 +998,25 @@ impl VideoDecoder {
             // auto-download via their own FFmpeg bitstream filters. The
             // decoder self-allocates its own internal `AVHWDeviceContext`
             // (DRM type), so `open_inner` needs no `hw_device_ctx` /
-            // `get_format` setup to *open* it — but every frame this
-            // backend returns must be explicitly transferred to system
-            // memory before the caller's NV12-based CPU-blit display
-            // path (or any other sysmem consumer) can touch it. Do that
-            // transfer here, transparently, so `DecoderBackend::Rkmpp`
-            // behaves like NVDEC/QSV from the caller's POV — an NV12
-            // sysmem producer — matching this module's documented
-            // contract instead of leaking DRM_PRIME frames that every
-            // existing sysmem-only consumer silently can't render.
+            // `get_format` setup to *open* it. By default we transfer
+            // to system memory here so `DecoderBackend::Rkmpp` behaves
+            // like NVDEC/QSV from the caller's POV — an NV12 sysmem
+            // producer — matching this module's documented contract.
+            // Callers that instead want zero-copy KMS scanout (the
+            // local-display output) opt out via `set_rkmpp_zero_copy`,
+            // in which case the raw DRM_PRIME frame passes through for
+            // `DecodedFrame::map_drm_prime` to export.
             if self.backend == DecoderBackend::Rkmpp
                 && (*frame).format == AVPixelFormat_AV_PIX_FMT_DRM_PRIME
+                && !self.rkmpp_zero_copy
             {
-                let dst = av_frame_alloc();
-                if dst.is_null() {
-                    av_frame_free(&mut { frame });
-                    return Err(VideoError::AllocFrame);
-                }
-                (*dst).format = AVPixelFormat_AV_PIX_FMT_NONE;
                 let transfer_start = std::time::Instant::now();
-                let xfer_ret = av_hwframe_transfer_data(dst, frame, 0);
+                let hw_frame = DecodedFrame { frame };
+                let result = hw_frame.download_to_sysmem();
                 self.last_transfer_us = Some(transfer_start.elapsed().as_micros() as u64);
-                if xfer_ret < 0 {
-                    av_frame_free(&mut { frame });
-                    let mut tmp = dst;
-                    av_frame_free(&mut tmp);
-                    return Err(VideoError::HwFrameMap(xfer_ret));
-                }
-                (*dst).pts = (*frame).pts;
-                (*dst).pkt_dts = (*frame).pkt_dts;
-                (*dst).colorspace = (*frame).colorspace;
-                (*dst).color_range = (*frame).color_range;
-                (*dst).color_trc = (*frame).color_trc;
-                (*dst).color_primaries = (*frame).color_primaries;
-                let carried = (AV_FRAME_FLAG_KEY
-                    | AV_FRAME_FLAG_INTERLACED
-                    | AV_FRAME_FLAG_TOP_FIELD_FIRST) as i32;
-                (*dst).flags |= (*frame).flags & carried;
-                av_frame_free(&mut { frame });
-                return Ok(DecodedFrame { frame: dst });
+                // `hw_frame`'s Drop frees the original DRM_PRIME frame
+                // here regardless of `download_to_sysmem`'s outcome.
+                return result;
             }
 
             Ok(DecodedFrame { frame })
