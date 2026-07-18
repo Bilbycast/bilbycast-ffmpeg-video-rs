@@ -38,9 +38,12 @@ video-encoder-rkmpp = ["libffmpeg-video-sys/video-encoder-rkmpp"]
 #   media driver at runtime; x86_64 only.
 # - `video-decoder-vaapi`: libva-dev (same dep as VAAPI encode) +
 #   working VAAPI driver at runtime; Linux only.
+# - `video-decoder-rkmpp`: librockchip-mpp-dev + libdrm-dev (same dep as
+#   RKMPP encode) + the MPP kernel driver at runtime; ARM Rockchip only.
 video-decoder-nvdec = ["libffmpeg-video-sys/video-decoder-nvdec"]
 video-decoder-qsv = ["libffmpeg-video-sys/video-decoder-qsv"]
 video-decoder-vaapi = ["libffmpeg-video-sys/video-decoder-vaapi"]
+video-decoder-rkmpp = ["libffmpeg-video-sys/video-decoder-rkmpp"]
 
 [dependencies]
 libffmpeg-video-sys = { path = "../libffmpeg-video-sys" }
