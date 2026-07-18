@@ -893,6 +893,51 @@ impl VideoDecoder {
                 return Err(VideoError::ReceiveFrame(ret));
             }
 
+            // RKMPP's `h264_rkmpp`/`hevc_rkmpp` decoders always emit
+            // `AV_PIX_FMT_DRM_PRIME` frames (opaque VPU-owned DMA-BUFs),
+            // never plain sysmem NV12 — unlike NVDEC/QSV, which
+            // auto-download via their own FFmpeg bitstream filters. The
+            // decoder self-allocates its own internal `AVHWDeviceContext`
+            // (DRM type), so `open_inner` needs no `hw_device_ctx` /
+            // `get_format` setup to *open* it — but every frame this
+            // backend returns must be explicitly transferred to system
+            // memory before the caller's NV12-based CPU-blit display
+            // path (or any other sysmem consumer) can touch it. Do that
+            // transfer here, transparently, so `DecoderBackend::Rkmpp`
+            // behaves like NVDEC/QSV from the caller's POV — an NV12
+            // sysmem producer — matching this module's documented
+            // contract instead of leaking DRM_PRIME frames that every
+            // existing sysmem-only consumer silently can't render.
+            if self.backend == DecoderBackend::Rkmpp
+                && (*frame).format == AVPixelFormat_AV_PIX_FMT_DRM_PRIME
+            {
+                let dst = av_frame_alloc();
+                if dst.is_null() {
+                    av_frame_free(&mut { frame });
+                    return Err(VideoError::AllocFrame);
+                }
+                (*dst).format = AVPixelFormat_AV_PIX_FMT_NONE;
+                let xfer_ret = av_hwframe_transfer_data(dst, frame, 0);
+                if xfer_ret < 0 {
+                    av_frame_free(&mut { frame });
+                    let mut tmp = dst;
+                    av_frame_free(&mut tmp);
+                    return Err(VideoError::HwFrameMap(xfer_ret));
+                }
+                (*dst).pts = (*frame).pts;
+                (*dst).pkt_dts = (*frame).pkt_dts;
+                (*dst).colorspace = (*frame).colorspace;
+                (*dst).color_range = (*frame).color_range;
+                (*dst).color_trc = (*frame).color_trc;
+                (*dst).color_primaries = (*frame).color_primaries;
+                let carried = (AV_FRAME_FLAG_KEY
+                    | AV_FRAME_FLAG_INTERLACED
+                    | AV_FRAME_FLAG_TOP_FIELD_FIRST) as i32;
+                (*dst).flags |= (*frame).flags & carried;
+                av_frame_free(&mut { frame });
+                return Ok(DecodedFrame { frame: dst });
+            }
+
             Ok(DecodedFrame { frame })
         }
     }
