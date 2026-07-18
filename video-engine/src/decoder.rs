@@ -22,14 +22,14 @@ use crate::vaapi::{
 /// Decoder backend — selects which FFmpeg decoder family `VideoDecoder`
 /// opens against. `Cpu` is the always-available libavcodec software
 /// path; the hardware variants need their corresponding Cargo features
-/// (`video-decoder-nvdec`, `video-decoder-qsv`, `video-decoder-vaapi`)
-/// AND a working driver + hardware at runtime — open will return
-/// `EncoderDisabled` / `OpenCodec` when the host can't satisfy the
-/// request.
+/// (`video-decoder-nvdec`, `video-decoder-qsv`, `video-decoder-vaapi`,
+/// `video-decoder-rkmpp`) AND a working driver + hardware at runtime —
+/// open will return `EncoderDisabled` / `OpenCodec` when the host can't
+/// satisfy the request.
 ///
 /// HW frames come back in NV12 system memory by default — the cuvid /
-/// QSV decoders auto-download to host memory via FFmpeg's built-in
-/// hwframe transfer. Callers pick up the layout via
+/// QSV / rkmpp decoders auto-download to host memory via FFmpeg's
+/// built-in hwframe transfer. Callers pick up the layout via
 /// [`DecodedFrame::pixel_format`] and either use [`DecodedFrame::yuv_planes`]
 /// (planar YUV) or [`DecodedFrame::nv12_planes`] (semi-planar NV12).
 ///
@@ -54,6 +54,12 @@ pub enum DecoderBackend {
     /// VAAPI via `h264_vaapi` / `hevc_vaapi`. Needs the
     /// `video-decoder-vaapi` Cargo feature. Linux only.
     Vaapi,
+    /// Rockchip MPP via `h264_rkmpp` / `hevc_rkmpp`. Needs the
+    /// `video-decoder-rkmpp` Cargo feature. ARM Rockchip (RK3568/RK3588)
+    /// only. Like NVDEC/QSV — a plain named decoder, NV12 system memory
+    /// output, no `AVHWDeviceContext`/`get_format` setup. No MPEG-2
+    /// decoder exists upstream for this backend.
+    Rkmpp,
 }
 
 impl DecoderBackend {
@@ -73,6 +79,9 @@ impl DecoderBackend {
             (DecoderBackend::Vaapi, VideoCodec::H264) => Some("h264_vaapi"),
             (DecoderBackend::Vaapi, VideoCodec::Hevc) => Some("hevc_vaapi"),
             (DecoderBackend::Vaapi, VideoCodec::Mpeg2) => Some("mpeg2_vaapi"),
+            (DecoderBackend::Rkmpp, VideoCodec::H264) => Some("h264_rkmpp"),
+            (DecoderBackend::Rkmpp, VideoCodec::Hevc) => Some("hevc_rkmpp"),
+            (DecoderBackend::Rkmpp, VideoCodec::Mpeg2) => None,
         }
     }
 }
@@ -294,7 +303,8 @@ impl DecodedFrame {
     ///
     /// Returns `Some((y, y_stride, uv, uv_stride))` when the pixel
     /// format is `AV_PIX_FMT_NV12` — the default 8-bit system-memory
-    /// output of `h264_cuvid` / `hevc_cuvid` / `h264_qsv` / `hevc_qsv`.
+    /// output of `h264_cuvid` / `hevc_cuvid` / `h264_qsv` / `hevc_qsv` /
+    /// `h264_rkmpp` / `hevc_rkmpp`.
     /// The UV plane is half-height (4:2:0 chroma sub-sampling) and
     /// contains interleaved U/V byte pairs at full chroma width — i.e.
     /// one CbCr pair per 2×2 luma block.
@@ -706,10 +716,10 @@ impl VideoDecoder {
                     };
                     avcodec_find_decoder(codec_id)
                 }
-                DecoderBackend::Nvdec | DecoderBackend::Qsv => {
-                    // NVDEC + QSV expose standalone decoder entries
-                    // (`h264_cuvid`, `hevc_qsv`, ...). Look up the name;
-                    // non-NULL result means the matching
+                DecoderBackend::Nvdec | DecoderBackend::Qsv | DecoderBackend::Rkmpp => {
+                    // NVDEC + QSV + RKMPP expose standalone decoder entries
+                    // (`h264_cuvid`, `hevc_qsv`, `h264_rkmpp`, ...). Look up
+                    // the name; non-NULL result means the matching
                     // `--enable-decoder=*` was passed to FFmpeg configure,
                     // which corresponds to the Cargo feature being on.
                     let Some(name) = backend.ffmpeg_decoder_name(codec) else {
