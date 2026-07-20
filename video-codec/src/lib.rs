@@ -771,6 +771,21 @@ pub enum VideoError {
     #[error("HW frame not on VAAPI device — no DRM PRIME surface to map")]
     HwFrameNotOnDevice,
 
+    /// The HW frames context declares a `sw_format` that cannot back a
+    /// sysmem download. Distinct from [`Self::HwFrameMap`] because it is
+    /// a *permanent* property of the stream + backend, not a transient
+    /// transfer failure: retrying per frame will never succeed, so the
+    /// caller should demote to CPU decode once rather than erroring
+    /// forever.
+    ///
+    /// Seen on RKMPP with 10-bit input: `rkmppdec.c` sets
+    /// `sw_format = AV_PIX_FMT_NV12` only for `DRM_FORMAT_NV12`, so any
+    /// 10-bit stream leaves it `AV_PIX_FMT_NONE`, and the DRM hwcontext's
+    /// `transfer_get_formats` hands that straight back as the only
+    /// candidate destination format.
+    #[error("HW frames context has no downloadable sw_format (backend/bit-depth unsupported for sysmem transfer)")]
+    UnsupportedHwFormat,
+
     /// The `get_format` callback ran but couldn't find `AV_PIX_FMT_VAAPI`
     /// in the codec's advertised format list — typical of a vendored
     /// FFmpeg without VAAPI compiled in for this codec, or the bitstream

@@ -579,8 +579,7 @@ impl DecodedFrame {
 
     /// Download a VAAPI or RKMPP HW frame to system memory. Allocates a
     /// fresh `AVFrame`, calls `av_hwframe_transfer_data` to copy the GPU
-    /// / VPU surface into sysmem (FFmpeg picks the best sysmem format —
-    /// NV12 for 8-bit YUV 4:2:0, P010LE for 10-bit), and returns a
+    /// / VPU surface into sysmem, and returns a
     /// new `DecodedFrame` whose `is_vaapi()`/`is_drm_prime()` are both
     /// `false` and whose semi-planar accessors return `Some`. The
     /// caller's existing SW-decoded codepath (libswscale + tonemap LUT
@@ -597,6 +596,19 @@ impl DecodedFrame {
     /// may already live in system memory so the transfer is effectively
     /// a pointer alias; on Intel iHD it's a real DMA.
     ///
+    /// **Destination format differs by backend.** For VAAPI, leaving
+    /// `dst.format` unset lets FFmpeg pick the best sysmem format from
+    /// the driver's real format list (`hwcontext_vaapi.c` builds one) —
+    /// NV12 for 8-bit 4:2:0, P010LE for 10-bit. The DRM hwcontext RKMPP
+    /// rides on does **not** do that: `drm_transfer_get_formats`
+    /// (`hwcontext_drm.c`) returns exactly `ctx->sw_format`, and
+    /// `rkmppdec.c` sets that to `AV_PIX_FMT_NV12` only when the DRM
+    /// fourcc is `DRM_FORMAT_NV12`, i.e. **8-bit only** — 10-bit yields
+    /// `AV_PIX_FMT_NONE` (mainline libdrm has no `DRM_FORMAT_NV12_10`).
+    /// A `NONE` sw_format makes `av_frame_get_buffer` fail `EINVAL`, so
+    /// this returns `VideoError::UnsupportedHwFormat` up front rather
+    /// than a bare `-22` on every frame forever — letting the caller
+    /// demote to CPU decode on the first frame. RKMPP is NV12-only here.
     /// Returns `Err(VideoError::HwFrameNotOnDevice)` for a frame that's
     /// neither VAAPI nor RKMPP DRM_PRIME, `Err(VideoError::AllocFrame)`
     /// on AVFrame alloc, and `Err(VideoError::HwFrameMap(_))` when the
@@ -613,6 +625,25 @@ impl DecodedFrame {
             // `format = AV_PIX_FMT_NONE` (-1) lets FFmpeg pick the
             // best sysmem format the hwdevice exposes. VAAPI returns
             // NV12 for 8-bit and P010LE for 10-bit surfaces.
+            //
+            // The DRM hwcontext (RKMPP) does not offer a real format
+            // list: `drm_transfer_get_formats` returns exactly
+            // `frames_ctx->sw_format`, which `rkmppdec.c` leaves as
+            // `AV_PIX_FMT_NONE` for anything that isn't `DRM_FORMAT_NV12`
+            // — i.e. every 10-bit stream. Letting that through means
+            // `av_frame_get_buffer` rejects `format < 0` with EINVAL on
+            // EVERY frame, with nothing distinguishing it from a
+            // transient transfer error. Check it up front and report a
+            // distinct, permanent error so the caller can demote to CPU
+            // decode once instead of failing forever.
+            if !(*self.frame).hw_frames_ctx.is_null() {
+                let fctx = (*(*self.frame).hw_frames_ctx).data as *const AVHWFramesContext;
+                if !fctx.is_null() && (*fctx).sw_format == AVPixelFormat_AV_PIX_FMT_NONE {
+                    let mut tmp = dst;
+                    av_frame_free(&mut tmp);
+                    return Err(VideoError::UnsupportedHwFormat);
+                }
+            }
             (*dst).format = AVPixelFormat_AV_PIX_FMT_NONE;
             let ret = av_hwframe_transfer_data(dst, self.frame, 0);
             if ret < 0 {
