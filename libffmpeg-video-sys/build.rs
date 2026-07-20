@@ -86,6 +86,7 @@ fn main() {
         .allowlist_function("av_frame_alloc")
         .allowlist_function("av_frame_free")
         .allowlist_function("av_frame_unref")
+        .allowlist_function("av_frame_ref")
         .allowlist_function("av_frame_get_buffer")
         .allowlist_function("av_frame_is_writable")
         .allowlist_function("av_image_get_buffer_size")
@@ -433,7 +434,8 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
     // DRM/DMA-BUF backed.
     let drm_required = cfg!(feature = "video-encoder-vaapi")
         || cfg!(feature = "video-decoder-vaapi")
-        || cfg!(feature = "video-encoder-rkmpp");
+        || cfg!(feature = "video-encoder-rkmpp")
+        || cfg!(feature = "video-decoder-rkmpp");
     if drm_required {
         configure_args.push("--enable-libdrm".into());
     } else {
@@ -700,22 +702,24 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-hwaccel=mpeg2_vaapi".into());
     }
 
-    // RKMPP: Rockchip Media Process Platform hardware H.264/HEVC encode
-    // (`h264_rkmpp` / `hevc_rkmpp`, upstream since FFmpeg 8.1). ARM Rockchip
-    // SoCs only (RK3568 / RK3588 / ...). FFmpeg's configure hard-requires
+    // RKMPP: Rockchip Media Process Platform hardware H.264/HEVC encode +
+    // decode (`h264_rkmpp` / `hevc_rkmpp`, upstream since FFmpeg 8.1 —
+    // the MPP library is bidirectional, so one `--enable-rkmpp` covers
+    // both encoder and decoder codec entries). ARM Rockchip SoCs only
+    // (RK3568 / RK3588 / ...). FFmpeg's configure hard-requires
     // pkg-config `rockchip_mpp >= 1.3.8` and `--enable-libdrm`
     // (configure:7500-7502). `--enable-libdrm` is emitted via the shared
-    // `drm_required` gate above (which now includes this feature). The
-    // library is distributed only as `librockchip_mpp.so` from the Rockchip
-    // BSP, so it is linked dynamically in `link_ffmpeg_libs`. There is no
-    // `rockchip_mpp` on x86_64 — this feature is only buildable on an
+    // `drm_required` gate above (which now includes both rkmpp features).
+    // The library is distributed only as `librockchip_mpp.so` from the
+    // Rockchip BSP, so it is linked dynamically in `link_ffmpeg_libs`.
+    // There is no `rockchip_mpp` on x86_64 — buildable only on an
     // aarch64 Rockchip host, where the probe below finds the BSP package.
-    if cfg!(feature = "video-encoder-rkmpp") {
+    if cfg!(feature = "video-encoder-rkmpp") || cfg!(feature = "video-decoder-rkmpp") {
         let mpp = pkg_config::Config::new().probe("rockchip_mpp").expect(
-            "pkg-config: rockchip_mpp not found. The video-encoder-rkmpp \
-             feature is ARM Rockchip-only and needs the Rockchip BSP \
-             librockchip-mpp-dev (>= 1.3.8, ships rockchip_mpp.pc) at build \
-             time. It cannot be built on x86_64.",
+            "pkg-config: rockchip_mpp not found. The video-encoder-rkmpp / \
+             video-decoder-rkmpp features are ARM Rockchip-only and need \
+             the Rockchip BSP librockchip-mpp-dev (>= 1.3.8, ships \
+             rockchip_mpp.pc) at build time. They cannot be built on x86_64.",
         );
         for inc in &mpp.include_paths {
             extra_cflags.push(' ');
@@ -731,8 +735,9 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         // path lands on extra_cflags even when VAAPI is not also enabled;
         // if both are on the extra `-I`/`-L` are harmless duplicates.
         let libdrm = pkg_config::Config::new().probe("libdrm").expect(
-            "pkg-config: libdrm not found. video-encoder-rkmpp requires \
-             libdrm-dev (FFmpeg's rkmpp code is gated on --enable-libdrm).",
+            "pkg-config: libdrm not found. video-encoder-rkmpp / \
+             video-decoder-rkmpp require libdrm-dev (FFmpeg's rkmpp code \
+             is gated on --enable-libdrm).",
         );
         for inc in &libdrm.include_paths {
             extra_cflags.push(' ');
@@ -751,8 +756,14 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         // ((L)GPLv3) relicensing is subsumed by AGPL-3.0.
         configure_args.push("--enable-version3".into());
         configure_args.push("--enable-rkmpp".into());
-        configure_args.push("--enable-encoder=h264_rkmpp".into());
-        configure_args.push("--enable-encoder=hevc_rkmpp".into());
+        if cfg!(feature = "video-encoder-rkmpp") {
+            configure_args.push("--enable-encoder=h264_rkmpp".into());
+            configure_args.push("--enable-encoder=hevc_rkmpp".into());
+        }
+        if cfg!(feature = "video-decoder-rkmpp") {
+            configure_args.push("--enable-decoder=h264_rkmpp".into());
+            configure_args.push("--enable-decoder=hevc_rkmpp".into());
+        }
     }
 
     // Extra cflags / ldflags must be passed last (accumulated across
@@ -929,7 +940,7 @@ fn link_ffmpeg_libs(include_opus: bool, gpl: &GplEncoderLink) {
             // carries a runtime DT_NEEDED on librockchip_mpp.so (>= 1.3.8),
             // which is board/BSP-version-specific and cannot be statically
             // baked. ARM Rockchip only.
-            if cfg!(feature = "video-encoder-rkmpp") {
+            if cfg!(feature = "video-encoder-rkmpp") || cfg!(feature = "video-decoder-rkmpp") {
                 println!("cargo:rustc-link-lib=rockchip_mpp");
             }
             // libdrm: linked because both the VAAPI DMA-BUF export path
@@ -940,6 +951,7 @@ fn link_ffmpeg_libs(include_opus: bool, gpl: &GplEncoderLink) {
             if cfg!(feature = "video-encoder-vaapi")
                 || cfg!(feature = "video-decoder-vaapi")
                 || cfg!(feature = "video-encoder-rkmpp")
+                || cfg!(feature = "video-decoder-rkmpp")
             {
                 println!("cargo:rustc-link-lib=drm");
             }

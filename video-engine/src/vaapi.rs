@@ -27,6 +27,15 @@
 //!   release it only after the kernel posts `DRM_EVENT_FLIP_COMPLETE` —
 //!   without it the VA surface gets reused mid-scanout and the screen
 //!   tears or freezes.
+//!
+//! - [`wrap_rkmpp_drm_prime`] — the RKMPP sibling of
+//!   [`map_vaapi_to_drm_prime`]. RKMPP's `h264_rkmpp`/`hevc_rkmpp`
+//!   decoders hand back `AV_PIX_FMT_DRM_PRIME` frames directly out of
+//!   `avcodec_receive_frame` (no opaque `AV_PIX_FMT_VAAPI` surface, so
+//!   no `av_hwframe_map` step is needed) — this just walks the
+//!   already-populated `AVDRMFrameDescriptor` into the same
+//!   [`DrmPrimeFrame`] shape so the KMS scanout side stays backend-
+//!   agnostic.
 
 use std::ffi::CString;
 use std::sync::Arc;
@@ -433,6 +442,103 @@ pub unsafe fn map_vaapi_to_drm_prime(
             return Err(VideoError::HwFrameMap(-22));
         }
     };
+
+    Ok(DrmPrimeFrame {
+        width,
+        height,
+        fourcc,
+        modifier,
+        planes: planes_out,
+        keepalive: Arc::new(DrmPrimeKeepalive { drm_frame }),
+    })
+}
+
+/// Wrap an RKMPP-decoded `AVFrame` (already `AV_PIX_FMT_DRM_PRIME` —
+/// `data[0]` is a populated `AVDRMFrameDescriptor*` straight out of
+/// `avcodec_receive_frame`, no `av_hwframe_map` step needed, unlike
+/// VAAPI's opaque `AV_PIX_FMT_VAAPI` surfaces) into a [`DrmPrimeFrame`]
+/// for zero-copy KMS scanout.
+///
+/// RKMPP exports a single-layer descriptor whose one layer carries
+/// every memory plane directly (`nb_layers == 1`,
+/// `layers[0].nb_planes == 2` for NV12 — Y then UV, both referencing
+/// the same DMA-BUF object) — the "ESH" shape this module's docs
+/// describe, but distinct from what [`map_vaapi_to_drm_prime`] actually
+/// accepts (that function only handles the ABH one-plane-per-layer
+/// split, per its own `layer.nb_planes != 1` guard) — so this walks
+/// planes *within* the layer instead of assuming one plane per layer.
+///
+/// Takes ownership of `drm_frame` — it is freed on `Err` and wrapped in
+/// the returned `DrmPrimeFrame`'s keepalive on `Ok`; the caller must
+/// not touch it afterward either way. Callers map their own
+/// `AVFrame*` first via `av_frame_clone`/`av_frame_ref` so this doesn't
+/// consume a frame still owned elsewhere (mirrors how
+/// `av_hwframe_map` hands `map_vaapi_to_drm_prime` an independently-
+/// owned mapped frame rather than the original decoded surface).
+///
+/// # Safety
+/// `drm_frame` must be a non-null, uniquely-owned `AVFrame*` with
+/// `format == AV_PIX_FMT_DRM_PRIME`.
+pub unsafe fn wrap_rkmpp_drm_prime(
+    drm_frame: *mut AVFrame,
+) -> Result<DrmPrimeFrame, VideoError> {
+    if drm_frame.is_null() {
+        return Err(VideoError::HwFrameNotOnDevice);
+    }
+    if (*drm_frame).format != AVPixelFormat_AV_PIX_FMT_DRM_PRIME {
+        let mut tmp = drm_frame;
+        av_frame_free(&mut tmp);
+        return Err(VideoError::HwFrameNotOnDevice);
+    }
+
+    let desc_ptr = (*drm_frame).data[0] as *const AVDRMFrameDescriptor;
+    if desc_ptr.is_null() {
+        let mut tmp = drm_frame;
+        av_frame_free(&mut tmp);
+        return Err(VideoError::HwFrameMap(-22));
+    }
+    let desc = &*desc_ptr;
+    if desc.nb_layers < 1 || desc.nb_objects < 1 {
+        let mut tmp = drm_frame;
+        av_frame_free(&mut tmp);
+        return Err(VideoError::HwFrameMap(-22));
+    }
+    if desc.nb_layers != 1 {
+        // RKMPP always exports a single NV12 layer. A multi-layer
+        // descriptor here means a driver/format shape this path
+        // hasn't been taught — reject rather than guess.
+        let mut tmp = drm_frame;
+        av_frame_free(&mut tmp);
+        return Err(VideoError::HwFrameMap(-22));
+    }
+    let layer = &desc.layers[0];
+    let nb_planes = layer.nb_planes as usize;
+    if nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES as usize {
+        let mut tmp = drm_frame;
+        av_frame_free(&mut tmp);
+        return Err(VideoError::HwFrameMap(-22));
+    }
+
+    let mut planes_out: Vec<DrmPrimePlane> = Vec::with_capacity(nb_planes);
+    for plane in layer.planes.iter().take(nb_planes) {
+        let obj_idx = plane.object_index as usize;
+        if obj_idx >= desc.nb_objects as usize {
+            let mut tmp = drm_frame;
+            av_frame_free(&mut tmp);
+            return Err(VideoError::HwFrameMap(-22));
+        }
+        let object = &desc.objects[obj_idx];
+        planes_out.push(DrmPrimePlane {
+            fd: object.fd,
+            offset: plane.offset as u32,
+            pitch: plane.pitch as u32,
+        });
+    }
+
+    let modifier = desc.objects[0].format_modifier;
+    let fourcc = layer.format;
+    let width = (*drm_frame).width as u32;
+    let height = (*drm_frame).height as u32;
 
     Ok(DrmPrimeFrame {
         width,

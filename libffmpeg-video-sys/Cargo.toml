@@ -71,6 +71,16 @@ video-decoder-vaapi = []
 # 8-bit 4:2:0 only. Default off — only buildable on an aarch64 Rockchip
 # host (there is no `rockchip_mpp` on x86_64).
 video-encoder-rkmpp = []
+# Enable Rockchip MPP (RKMPP) hardware H.264/HEVC decoding via the FFmpeg
+# `h264_rkmpp` / `hevc_rkmpp` decoders (same upstream FFmpeg 8.1 rkmpp
+# support as the encoder — the MPP library is bidirectional). Adds
+# `--enable-decoder=h264_rkmpp --enable-decoder=hevc_rkmpp`, sharing the
+# `--enable-rkmpp --enable-libdrm` gate and `librockchip_mpp`/`libdrm`
+# link with the encoder feature. NV12 system-memory output by default,
+# like the cuvid / QSV decoders — no MPEG-2 decoder exists for this
+# backend. Same build/runtime prerequisites as `video-encoder-rkmpp`.
+# Default off — aarch64 Rockchip only.
+video-decoder-rkmpp = []
 
 [lib]
 doctest = false
