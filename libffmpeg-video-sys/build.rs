@@ -583,6 +583,12 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
         configure_args.push("--enable-cuvid".into());
         configure_args.push("--enable-decoder=h264_cuvid".into());
         configure_args.push("--enable-decoder=hevc_cuvid".into());
+        // MPEG-2 was missing from this list, which made every
+        // `mpeg2_cuvid` open fail (decoder-by-name = NULL) and demoted
+        // the bilbycast-edge display path to CPU — misdiagnosed for a
+        // while as "NVDEC rejects the stream". The silicon decodes
+        // MPEG-2 Main Profile fine; the decoder just wasn't compiled.
+        configure_args.push("--enable-decoder=mpeg2_cuvid".into());
     }
 
     // QSV encoder + decoder share libvpl. Probe pkg-config once when
