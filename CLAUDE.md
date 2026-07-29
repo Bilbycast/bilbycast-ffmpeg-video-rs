@@ -14,7 +14,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 
 | Crate | Role |
 |-------|------|
-| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n7.1.3) + `libffmpeg-video-sys/vendor/opus` (v1.5.2). |
+| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n8.1.2) + `libffmpeg-video-sys/vendor/opus` (v1.6.1). |
 | **video-codec** | Pure-Rust data types (video/audio codec enums, errors, config). No C dependency. |
 | **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioDecoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`. The crate bilbycast-edge depends on. |
 
