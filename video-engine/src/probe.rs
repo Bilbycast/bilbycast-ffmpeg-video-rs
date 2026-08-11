@@ -698,20 +698,39 @@ unsafe fn try_open_decoder_context(
     Ok(ctx)
 }
 
-/// Walk a decoder's `pix_fmts` array (NULL-terminated by
+/// Walk a decoder's supported pixel-format list (NULL-terminated by
 /// `AV_PIX_FMT_NONE = -1`) and return `true` if at least one entry is
 /// a system-memory layout the safe wrapper's `DecodedFrame::*_planes`
-/// accessors can drain. Decoders with a NULL `pix_fmts` list (no
-/// declared advertisement) are conservatively accepted — that includes
-/// most software decoders (`avcodec_find_decoder(H264)`), which always
-/// produce planar YUV.
+/// accessors can drain. Decoders that advertise no list are
+/// conservatively accepted — that includes most software decoders
+/// (`avcodec_find_decoder(H264)`), which always produce planar YUV.
+///
+/// Queried via `avcodec_get_supported_config` rather than the old
+/// `AVCodec::pix_fmts` field: FFmpeg n9.0 deletes that field (along with
+/// `supported_framerates` / `supported_samplerates` / `sample_fmts` /
+/// `ch_layouts`) from the struct. The accessor exists in n8.1.2 as well, so
+/// this compiles at both tags and needs no version gate.
+///
+/// The two APIs agree on the permissive case, which is what keeps the
+/// surrounding logic unchanged: the old field was NULL when a codec made no
+/// advertisement, and the new call yields a NULL list to mean "all values
+/// supported". Both land on "accept".
 unsafe fn decoder_has_drainable_pix_fmt(codec_ptr: *const AVCodec) -> bool {
-    let mut p = (*codec_ptr).pix_fmts;
-    if p.is_null() {
-        // No advertisement → trust the runtime path to surface anything
-        // unreadable. Keeps us from rejecting SW decoders.
+    let mut list: *const std::ffi::c_void = std::ptr::null();
+    let ret = avcodec_get_supported_config(
+        std::ptr::null(),
+        codec_ptr,
+        AVCodecConfig_AV_CODEC_CONFIG_PIX_FORMAT,
+        0,
+        &mut list,
+        std::ptr::null_mut(),
+    );
+    if ret < 0 || list.is_null() {
+        // Query failed, or "all values supported" → trust the runtime path to
+        // surface anything unreadable. Keeps us from rejecting SW decoders.
         return true;
     }
+    let mut p = list as *const AVPixelFormat;
     while *p != AVPixelFormat_AV_PIX_FMT_NONE {
         if is_drainable_pix_fmt(*p) {
             return true;

@@ -34,11 +34,18 @@ fn main() {
         ffmpeg_path.join("include")
     } else if cfg!(feature = "system-ffmpeg") {
         // System FFmpeg via pkg-config
+        // 61.13.100 (FFmpeg 7.1), not 60.0.0: `probe.rs` calls
+        // `avcodec_get_supported_config()`, added in lavc 61.13.100 per
+        // doc/APIchanges, because FFmpeg n9.0 deletes the `AVCodec::pix_fmts`
+        // field it replaces. bindgen emits nothing for an allowlisted symbol
+        // the headers don't declare, so an older system FFmpeg would fail at
+        // link/resolve time rather than here — state the real floor instead.
+        // (The vendored build is unaffected; it is n9.0.)
         let avcodec = pkg_config::Config::new()
-            .atleast_version("60.0.0")
+            .atleast_version("61.13.100")
             .probe("libavcodec")
             .expect(
-                "pkg-config: libavcodec >= 60.0.0 not found. \
+                "pkg-config: libavcodec >= 61.13.100 (FFmpeg 7.1) not found. \
                  Install libavcodec-dev or set LIBFFMPEG_DIR",
             );
         let _avutil = pkg_config::Config::new()
@@ -120,6 +127,14 @@ fn main() {
         .allowlist_function("av_hwframe_get_buffer")
         .allowlist_function("avcodec_get_hw_frames_parameters")
         .allowlist_function("avcodec_get_hw_config")
+        // Replaces the `AVCodec::pix_fmts` / `supported_framerates` /
+        // `supported_samplerates` / `sample_fmts` / `ch_layouts` fields, which
+        // FFmpeg n9.0 deletes from the struct. The accessor already exists in
+        // n8.1.2 (avcodec.h), so probe.rs can use it at both tags and this
+        // allowlist entry is safe ahead of the submodule bump.
+        .allowlist_function("avcodec_get_supported_config")
+        .allowlist_type("AVCodecConfig")
+        .allowlist_var("AV_CODEC_CONFIG_.*")
         .allowlist_function("av_buffer_ref")
         .allowlist_function("av_buffer_unref")
         .allowlist_function("av_buffer_alloc")
