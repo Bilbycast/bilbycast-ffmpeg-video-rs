@@ -21,6 +21,31 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Track the vendored C submodule pins.
+    //
+    // Load-bearing, and subtle: the moment a build script emits ANY
+    // `cargo:rerun-if-*` directive, cargo STOPS re-running it on arbitrary
+    // changes to the package's files and honours only what was declared. This
+    // script emits `rerun-if-env-changed=PKG_CONFIG_PATH` further down, so
+    // before these lines a `git checkout n9.0.1` inside `vendor/ffmpeg`
+    // changed nothing cargo could see: the crate kept linking the previously
+    // built archives and reported success.
+    //
+    // That is precisely the failure the `Compare vendored C pins against
+    // upstream releases` audit exists to prevent, inverted — the pin would say
+    // n9.0.1 while the binary still carried n9.0, and every check would be
+    // green. Worse under CI, which restores a cached target directory.
+    //
+    // `RELEASE` and `configure` are cheap, stable proxies for "the vendored
+    // tree moved to a different release": both change across any upstream
+    // release bump, and neither costs a recursive stat of a ~10 000-file
+    // source tree the way naming the directory would. A move to an arbitrary
+    // non-release commit within the same series is NOT caught — say so rather
+    // than imply coverage this does not have.
+    println!("cargo:rerun-if-changed=vendor/ffmpeg/RELEASE");
+    println!("cargo:rerun-if-changed=vendor/ffmpeg/configure");
+    println!("cargo:rerun-if-changed=vendor/opus/configure.ac");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let include_path = if let Ok(ffmpeg_dir) = env::var("LIBFFMPEG_DIR") {
@@ -40,7 +65,7 @@ fn main() {
         // field it replaces. bindgen emits nothing for an allowlisted symbol
         // the headers don't declare, so an older system FFmpeg would fail at
         // link/resolve time rather than here — state the real floor instead.
-        // (The vendored build is unaffected; it is n9.0.)
+        // (The vendored build is unaffected; it is n9.0.1.)
         let avcodec = pkg_config::Config::new()
             .atleast_version("61.13.100")
             .probe("libavcodec")
