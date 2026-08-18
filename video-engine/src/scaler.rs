@@ -134,6 +134,20 @@ fn scaler_dst_pix_fmt(fmt: ScalerDstFormat) -> i32 {
 ///
 /// Returns `None` for combinations that the scaler / encoder don't
 /// support today (4:4:4).
+/// The `AVPixelFormat` integer for packed 8-bit BGRA.
+///
+/// Exposed for the same reason as [`av_pix_fmt_for_yuv`]: a caller that has
+/// composited into a packed BGRA buffer — the multiviewer canvas is the case
+/// this was added for — needs to describe that buffer to
+/// [`VideoScaler::scale_raw_planes`] on the way to an encoder, and edge-side
+/// crates deliberately do not depend on `libffmpeg-video-sys`.
+///
+/// BGRA is the only packed format [`ScalerDstFormat`] offers, so a compositor
+/// that blits with `scale_raw_planes_into_packed` always ends up here.
+pub fn av_pix_fmt_bgra() -> i32 {
+    AVPixelFormat_AV_PIX_FMT_BGRA
+}
+
 pub fn av_pix_fmt_for_yuv(chroma: video_codec::VideoChroma, bit_depth: u8) -> Option<i32> {
     use video_codec::VideoChroma;
     match (chroma, bit_depth) {
@@ -374,6 +388,50 @@ impl VideoScaler {
     /// must agree with what the scaler was constructed for. The
     /// destination format must be packed (currently `Bgra8`).
     #[allow(clippy::too_many_arguments)]
+    /// Is `dst` big enough for a packed write of `dst_width x dst_height` at
+    /// `dst_pitch`?
+    ///
+    /// **The requirement is `(h-1)*pitch + w*bpp`, not `pitch*h`.** libswscale
+    /// writes `dst_width` pixels per row and steps `dst_pitch` between rows, so
+    /// it never touches the padding after the final row — verified with guard
+    /// bytes, not assumed.
+    ///
+    /// The difference is not academic, and it is why this is a shared helper
+    /// rather than three copies of `pitch * h`. The multiviewer compositor
+    /// blits each tile by handing this function a **canvas-pitched sub-slice**
+    /// at the tile's byte offset. For a tile on the bottom row of the canvas
+    /// the remaining tail is exactly `x0 * bpp` bytes short of `pitch * h`, so
+    /// the old check refused the entire bottom row of every wall — while the
+    /// write it was guarding would have been completely in bounds. On a 2x2
+    /// wall at 1920x1080 the bottom-right tile missed by 3840 bytes.
+    ///
+    /// It also refused a mosaic on the panel path outright:
+    /// `KmsDisplay::back_buffer()` maps exactly `pitch * height`, so no
+    /// bottom-row tile could ever be blitted straight into the scanout buffer.
+    ///
+    /// Still strictly a bounds check — it only stops over-rejecting writes that
+    /// were always safe.
+    fn check_packed_dst(&self, dst: &[u8], dst_pitch: usize) -> Result<(), VideoError> {
+        const PACKED_BYTES_PER_PIXEL: usize = 4; // BGRA8, the only packed dst
+        let rows = self.dst_height.max(0) as usize;
+        let last_row = self.dst_width.max(0) as usize * PACKED_BYTES_PER_PIXEL;
+        let needed = match rows.checked_sub(1) {
+            None => 0,
+            Some(full_rows) => full_rows.saturating_mul(dst_pitch).saturating_add(last_row),
+        };
+        if dst_pitch < last_row {
+            return Err(VideoError::InvalidInput(
+                "dst_pitch is narrower than one row of the destination",
+            ));
+        }
+        if dst.len() < needed {
+            return Err(VideoError::InvalidInput(
+                "destination buffer smaller than (dst_height - 1) * dst_pitch + dst_width * 4",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn scale_raw_planes_into_packed(
         &self,
         src_w: u32,
@@ -393,12 +451,7 @@ impl VideoScaler {
                 "scale_raw_planes_into_packed requires a packed destination format",
             ));
         }
-        let needed = dst_pitch.saturating_mul(self.dst_height as usize);
-        if dst.len() < needed {
-            return Err(VideoError::InvalidInput(
-                "destination buffer smaller than dst_pitch * dst_height",
-            ));
-        }
+        self.check_packed_dst(dst, dst_pitch)?;
         let _ = (src_w, src_h, src_format); // shape is locked at scaler construction
         unsafe {
             let mut src_data: [*const u8; 4] = [std::ptr::null(); 4];
@@ -468,12 +521,7 @@ impl VideoScaler {
                 "scale_semi_planar_into_packed requires a packed destination format",
             ));
         }
-        let needed = dst_pitch.saturating_mul(self.dst_height as usize);
-        if dst.len() < needed {
-            return Err(VideoError::InvalidInput(
-                "destination buffer smaller than dst_pitch * dst_height",
-            ));
-        }
+        self.check_packed_dst(dst, dst_pitch)?;
         let _ = (src_w, y.len(), uv.len()); // shape is locked at scaler construction
         unsafe {
             let mut src_data: [*const u8; 4] = [std::ptr::null(); 4];
@@ -521,12 +569,7 @@ impl VideoScaler {
                 "scale_into_packed requires a packed destination format",
             ));
         }
-        let needed = dst_pitch.saturating_mul(self.dst_height as usize);
-        if dst.len() < needed {
-            return Err(VideoError::InvalidInput(
-                "destination buffer smaller than dst_pitch * dst_height",
-            ));
-        }
+        self.check_packed_dst(dst, dst_pitch)?;
         unsafe {
             let src_frame = src.as_ptr();
             let mut dst_data: [*mut u8; 4] = [std::ptr::null_mut(); 4];

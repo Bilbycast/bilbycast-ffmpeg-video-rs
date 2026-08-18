@@ -42,7 +42,7 @@ pub use probe::{
     ProbeChroma, ProbeError, PROBE_HEIGHT, PROBE_HEIGHT_1080P, PROBE_HEIGHT_4K, PROBE_WIDTH,
     PROBE_WIDTH_1080P, PROBE_WIDTH_4K,
 };
-pub use scaler::{av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
+pub use scaler::{av_pix_fmt_bgra, av_pix_fmt_for_yuv, ScaledFrame, VideoScaler};
 pub use thumbnail::{decode_thumbnail, decode_thumbnail_packets};
 pub use video_encoder::VideoEncoder;
 
