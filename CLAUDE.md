@@ -112,6 +112,41 @@ cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 `VideoScaler` wraps FFmpeg's `SwsContext`:
 - `new(src_w, src_h, src_fmt, dst_w, dst_h)` — configure scaling
 - `scale(frame)` → `ScaledFrame` in YUVJ420P (full-range, MJPEG-compatible)
+- `new_with_dst_format(src_w, src_h, src_fmt, dst_w, dst_h, ScalerDstFormat)` —
+  pick the destination format instead of taking `new()`'s YUVJ420P: the planar
+  broadcast formats `Yuv420p8` / `Yuv422p8` / `Yuv420p10le` / `Yuv422p10le`
+  (encoder feeds, RFC 4175 packetizers) or packed `Bgra8`
+- `scale_raw_planes(src_w, src_h, src_fmt, y, y_stride, u, u_stride, v, v_stride)`
+  → `ScaledFrame` — scale from caller-owned Y/U/V planes with explicit strides;
+  no `DecodedFrame` needed. The planes are wrapped, not copied
+- `scale_into_packed(frame, dst, dst_pitch)` /
+  `scale_raw_planes_into_packed(...)` / `scale_semi_planar_into_packed(...)`
+  (the last takes NV12-shaped Y + interleaved UV) — scale straight into a
+  caller-supplied packed BGRA8 buffer at an arbitrary `dst_pitch`. Handing in a
+  **canvas-pitched sub-slice starting at a tile's byte offset** would blit into
+  a sub-rectangle with no intermediate copy, and `bilbycast-edge`'s canvas
+  geometry (`engine/mosaic.rs`: `Canvas::byte_offset` + `required_tail`) is
+  built around exactly that contract — but **no runtime caller uses that form
+  today**, and those two helpers are currently only exercised by tests. Both
+  in-tree callers hand in a whole buffer: the multiviewer tile path
+  (`engine/input_mosaic.rs`) scales into a tight per-tile patch and then
+  row-copies it onto the canvas, and the local-display path
+  (`engine/output_display.rs`) scales straight into the mapped KMS back buffer
+  at the scanout pitch.
+  **Buffer-size contract: `(dst_height - 1) * dst_pitch + dst_width * 4`, not
+  `dst_pitch * dst_height`** (`check_packed_dst`). libswscale never writes past
+  the last row's real width, so demanding a full trailing stride over-rejected
+  writes that were always in bounds — it refused every bottom-row tile of a
+  mosaic (3840 bytes short on a 2x2 1080p wall) and made a mosaic impossible on
+  the display path outright, where `KmsDisplay::back_buffer()` maps exactly
+  `pitch * height`
+- `set_yuv_to_rgb_colorspace(src_colorspace, src_full_range)` — the YUV→RGB
+  matrix (`AVColorSpace`) and luma range for the packed path; a no-op when the
+  destination is not packed. Without it libswscale assumes BT.601 for SD-shaped
+  input, which gives muddy greens / oversaturated reds on a BT.709 HD source
+- `av_pix_fmt_bgra()` / `av_pix_fmt_for_yuv(chroma, bit_depth)` — the raw
+  `AVPixelFormat` integers, re-exported from the crate root so a consumer can
+  describe a buffer without depending on `libffmpeg-video-sys` itself
 
 ### JPEG Encoder (`video-engine/src/encoder.rs`)
 
