@@ -1,10 +1,10 @@
 [package]
 name = "video-codec"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "MPL-2.0"
 description = "Pure Rust types for video codec configuration, errors, and frame info"
 publish = false
 
 [dependencies]
-thiserror = "2.0.18"
+thiserror = "2.0.20"
