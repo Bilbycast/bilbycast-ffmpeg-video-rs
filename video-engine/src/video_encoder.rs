@@ -169,6 +169,29 @@ fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> &st
     if matches!(codec, VideoEncoderCodec::X264 | VideoEncoderCodec::X265) {
         return profile;
     }
+    // RKMPP is the exception among the HW backends: its `profile` is an
+    // *integer* AVOption with no named constants, so a spelling like "high"
+    // reaches libavutil's expression evaluator and is rejected outright —
+    // `Undefined constant or missing '(' in 'high'`, then EINVAL out of
+    // `avcodec_open2`. The operator sees a flow that will not start and no
+    // indication which option was at fault. Map to the profile_idc values it
+    // actually wants.
+    if matches!(codec, VideoEncoderCodec::H264Rkmpp) {
+        return match profile {
+            "baseline" => "66",
+            "main" => "77",
+            "high" => "100",
+            other => other,
+        };
+    }
+    if matches!(codec, VideoEncoderCodec::HevcRkmpp) {
+        return match profile {
+            "main" => "1",
+            "main10" => "2",
+            other => other,
+        };
+    }
+
     // libavcodec HEVC backends: `ff_hevc_profiles` canonical names.
     // 4:2:2 10-bit is encoded under FF_PROFILE_HEVC_REXT → "Rext".
     // The intra-only variant is signalled by the bitstream constraint
