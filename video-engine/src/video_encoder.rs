@@ -162,33 +162,56 @@ fn bytes_per_sample(bit_depth: u8) -> usize {
 /// path that does not match a known x264 / x265 alias preserves the
 /// operator's string, including future profile names we do not know
 /// about yet).
-fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> &str {
+///
+/// `None` means "send no `profile` option to this backend at all". Only
+/// RKMPP produces it — see the note on that arm.
+fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> Option<&str> {
     // x264 / x265 backends route through their own param-apply machinery —
     // pass through verbatim. Same for any non-HW backend we add in the
     // future that the operator-facing names are written against.
     if matches!(codec, VideoEncoderCodec::X264 | VideoEncoderCodec::X265) {
-        return profile;
+        return Some(profile);
     }
-    // RKMPP is the exception among the HW backends: its `profile` is an
-    // *integer* AVOption with no named constants, so a spelling like "high"
-    // reaches libavutil's expression evaluator and is rejected outright —
-    // `Undefined constant or missing '(' in 'high'`, then EINVAL out of
-    // `avcodec_open2`. The operator sees a flow that will not start and no
-    // indication which option was at fault. Map to the profile_idc values it
-    // actually wants.
+    // RKMPP is the exception among the HW backends: `rkmpp_options` in
+    // libavcodec/rkmppenc.c declares only `rc`, so `profile` falls through
+    // to AVCodecContext's *generic* one — an AV_OPT_TYPE_INT whose only
+    // named constants are `unknown` and `main10` (libavcodec/options_table.h).
+    // Every other spelling reaches libavutil's expression evaluator and is
+    // rejected outright — `Unable to parse "profile" option value "high"`,
+    // then EINVAL out of `avcodec_open2`. The operator sees a flow that will
+    // not start and no indication which option was at fault. Map to the
+    // profile_idc values the integer option wants.
+    //
+    // A spelling the table does not carry is **dropped, not passed through**:
+    // passing it reproduces exactly that EINVAL, and it names something this
+    // encoder cannot produce anyway — `open()` has already refused every
+    // chroma and bit depth other than 4:2:0 8-bit.
+    //
+    // Worth knowing before extending the table: on the vendored FFmpeg
+    // (n9.0.1) the value never reaches the encoder. `rkmpp_init_encoder`
+    // neither reads `avctx->profile` nor sets `h264:profile` on the
+    // `MppEncCfg`, so MPP encodes at its own default whatever is asked for.
+    // The mapping is here to keep `avcodec_open2` from failing, and to be
+    // right on the day the wrapper starts reading it.
     if matches!(codec, VideoEncoderCodec::H264Rkmpp) {
         return match profile {
-            "baseline" => "66",
-            "main" => "77",
-            "high" => "100",
-            other => other,
+            "baseline" => Some("66"),
+            "main" => Some("77"),
+            "high" => Some("100"),
+            // high10 / high422 / high444 name a 10-bit or 4:2:2 / 4:4:4
+            // bitstream; the RK3568 / RK3588 VEPU has neither.
+            _ => None,
         };
     }
     if matches!(codec, VideoEncoderCodec::HevcRkmpp) {
         return match profile {
-            "main" => "1",
-            "main10" => "2",
-            other => other,
+            "main" => Some("1"),
+            // `main10` is the one spelling the generic option already
+            // accepted on its own (AV_PROFILE_HEVC_MAIN_10 == 2), so a
+            // config carrying it starts today and must keep starting —
+            // the VEPU encodes it 8-bit either way.
+            "main10" => Some("2"),
+            _ => None,
         };
     }
 
@@ -196,7 +219,7 @@ fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> &st
     // 4:2:2 10-bit is encoded under FF_PROFILE_HEVC_REXT → "Rext".
     // The intra-only variant is signalled by the bitstream constraint
     // flag, not a separate profile_id — the same "Rext" entry covers it.
-    match profile {
+    Some(match profile {
         "main422-10" | "main422-10-intra" => "rext",
         // libx264 4:2:2 8-bit profile maps to FF_PROFILE_H264_HIGH_422.
         // The generic AVOption name is "High 4:2:2", but operators write
@@ -208,7 +231,7 @@ fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> &st
         // already matches the canonical name and round-trips through
         // av_dict_set without remapping.
         other => other,
-    }
+    })
 }
 
 fn vaapi_sw_format_for(chroma: VideoChroma, bit_depth: u8) -> AVPixelFormat {
@@ -636,10 +659,13 @@ impl VideoEncoder {
                 // remap before handing them to a HW backend or
                 // `avcodec_open2` returns an opaque EINVAL (the symptom
                 // that surfaced as F1's sibling regression in cellPTP7b).
-                let remapped = translate_profile_for_backend(config.codec, profile);
-                let profile_key = std::ffi::CString::new("profile").unwrap();
-                let profile_val = std::ffi::CString::new(remapped).unwrap();
-                av_dict_set(&mut opts, profile_key.as_ptr(), profile_val.as_ptr(), 0);
+                // `None` = this backend must not be sent a `profile` at all
+                // (RKMPP, for a spelling its integer option would reject).
+                if let Some(remapped) = translate_profile_for_backend(config.codec, profile) {
+                    let profile_key = std::ffi::CString::new("profile").unwrap();
+                    let profile_val = std::ffi::CString::new(remapped).unwrap();
+                    av_dict_set(&mut opts, profile_key.as_ptr(), profile_val.as_ptr(), 0);
+                }
             }
 
             // Tuning: configurable. Empty string = don't pass to encoder
@@ -1684,6 +1710,113 @@ fn parse_color_range(s: &str) -> Option<AVColorRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every spelling `VideoProfile::as_str` can produce, so a new profile
+    /// variant cannot be added without a decision being taken here.
+    const ALL_PROFILE_SPELLINGS: &[&str] = &[
+        "baseline",
+        "main",
+        "high",
+        "high10",
+        "high422",
+        "high444",
+        "main10",
+        "main422-10",
+        "main422-10-intra",
+    ];
+
+    #[test]
+    fn rkmpp_profiles_become_profile_idc_digits() {
+        // h264_rkmpp / hevc_rkmpp declare no private `profile` option, so the
+        // name lands on AVCodecContext's integer one, where a word is an
+        // expression-evaluator error and EINVAL out of `avcodec_open2`.
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::H264Rkmpp, "baseline"),
+            Some("66")
+        );
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::H264Rkmpp, "main"),
+            Some("77")
+        );
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::H264Rkmpp, "high"),
+            Some("100")
+        );
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::HevcRkmpp, "main"),
+            Some("1")
+        );
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::HevcRkmpp, "main10"),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn rkmpp_never_forwards_a_name_its_integer_option_would_reject() {
+        // The failure this mapping exists to prevent is not specific to the
+        // three spellings it translates: any word reaching the generic
+        // integer option produces the same opaque EINVAL. So an unmapped
+        // name must be dropped, never passed through.
+        for codec in [VideoEncoderCodec::H264Rkmpp, VideoEncoderCodec::HevcRkmpp] {
+            for spelling in ALL_PROFILE_SPELLINGS {
+                match translate_profile_for_backend(codec, spelling) {
+                    None => {}
+                    Some(v) => assert!(
+                        v.bytes().all(|b| b.is_ascii_digit()),
+                        "{codec:?} would send profile={v:?} for {spelling:?}, \
+                         which is not a profile_idc the integer option can parse"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_backend_still_gets_a_profile() {
+        // Only RKMPP drops one; a `None` anywhere else would silently stop
+        // sending a profile operators had configured.
+        for codec in [
+            VideoEncoderCodec::X264,
+            VideoEncoderCodec::X265,
+            VideoEncoderCodec::H264Nvenc,
+            VideoEncoderCodec::HevcNvenc,
+            VideoEncoderCodec::H264Qsv,
+            VideoEncoderCodec::HevcQsv,
+            VideoEncoderCodec::H264Vaapi,
+            VideoEncoderCodec::HevcVaapi,
+        ] {
+            for spelling in ALL_PROFILE_SPELLINGS {
+                assert!(
+                    translate_profile_for_backend(codec, spelling).is_some(),
+                    "{codec:?} dropped profile {spelling:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x264_x265_keep_their_own_spellings_and_hw_gets_ffmpeg_canonical() {
+        // x264 / x265 route `profile` through their own param-apply tables.
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::X265, "main422-10-intra"),
+            Some("main422-10-intra")
+        );
+        // The libavcodec HEVC backends carry 4:2:2 10-bit under Rext.
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::HevcVaapi, "main422-10"),
+            Some("rext")
+        );
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::HevcQsv, "main422-10-intra"),
+            Some("rext")
+        );
+        // Names that already match FFmpeg's canonical spelling pass through.
+        assert_eq!(
+            translate_profile_for_backend(VideoEncoderCodec::H264Nvenc, "high"),
+            Some("high")
+        );
+    }
 
     #[test]
     fn open_without_feature_returns_disabled() {
