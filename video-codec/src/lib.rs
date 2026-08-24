@@ -468,7 +468,7 @@ impl VideoChroma {
     /// Chroma plane width given the luma width (rounded up for 4:2:x).
     pub fn chroma_width(self, width: u32) -> u32 {
         match self {
-            Self::Yuv420 | Self::Yuv422 => (width + 1) / 2,
+            Self::Yuv420 | Self::Yuv422 => width.div_ceil(2),
             Self::Yuv444 => width,
         }
     }
@@ -476,7 +476,7 @@ impl VideoChroma {
     /// Chroma plane height given the luma height (rounded up for 4:2:0).
     pub fn chroma_height(self, height: u32) -> u32 {
         match self {
-            Self::Yuv420 => (height + 1) / 2,
+            Self::Yuv420 => height.div_ceil(2),
             Self::Yuv422 | Self::Yuv444 => height,
         }
     }

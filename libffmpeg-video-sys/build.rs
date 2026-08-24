@@ -17,7 +17,7 @@
 //! container parsing.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -298,7 +298,7 @@ fn find_static_archive(name: &str, probe_link_paths: &[PathBuf]) -> Option<PathB
 
 /// Build libopus from vendored source using CMake.
 /// Returns the install directory.
-fn build_opus(out_dir: &PathBuf) -> PathBuf {
+fn build_opus(out_dir: &Path) -> PathBuf {
     let opus_source = PathBuf::from("vendor/opus");
     if !opus_source.exists() {
         panic!(
@@ -323,7 +323,7 @@ fn build_opus(out_dir: &PathBuf) -> PathBuf {
 }
 
 /// Build FFmpeg from vendored source using ./configure + make.
-fn build_vendored(out_dir: &PathBuf) -> PathBuf {
+fn build_vendored(out_dir: &Path) -> PathBuf {
     let ffmpeg_source = PathBuf::from("vendor/ffmpeg");
     if !ffmpeg_source.exists() {
         panic!(
