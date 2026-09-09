@@ -6,7 +6,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 
 - **Video decode:** H.264 / HEVC / MPEG-1 / MPEG-2 (the libavcodec `mpeg2video` decoder accepts both MPEG-1 and MPEG-2 bitstreams)
 - **Video scale:** libswscale (YUVJ420P, YUV422P 8/10-bit, YUV420P 10-bit, BGRA output via `ScalerDstFormat`)
-- **Video encode:** MJPEG (thumbnails, always on) + **optional** libx264 / libx265 / NVENC via opt-in Cargo features
+- **Video encode:** MJPEG (thumbnails, always on) + **optional** libx264 / libx265 / NVENC / QSV / VAAPI / RKMPP via opt-in Cargo features
 - **Audio decode:** Opus / MP2 / AC-3 / E-AC-3 / AAC-LATM (non-AAC-LC broadcast codecs; AAC-LC decode is handled by `bilbycast-fdk-aac-rs`)
 - **Audio encode:** Opus, MP2, AC-3 (AAC encode is handled by `bilbycast-fdk-aac-rs`)
 
@@ -16,7 +16,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 |-------|------|
 | **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n9.0.1) + `libffmpeg-video-sys/vendor/opus` (v1.6.1). The `system-ffmpeg` alternative needs libavcodec >= 61.13.100 (FFmpeg 7.1) — `probe.rs` calls `avcodec_get_supported_config()`, since n9.0 deletes the `AVCodec::pix_fmts` field it replaces. |
 | **video-codec** | Pure-Rust data types (video/audio codec enums, errors, config). No C dependency. |
-| **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioDecoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`. The crate bilbycast-edge depends on. |
+| **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioDecoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`, plus the equally public `probe` (host encoder/decoder availability + session-capacity probes) and `vaapi` (`VaapiDevice`, `hw_frames_ctx` allocation, DRM PRIME export) modules. The crate bilbycast-edge depends on. |
 
 ## Codec Support
 
@@ -40,6 +40,13 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 | **NVENC H.264 / HEVC encode** | Opt-in via `video-encoder-nvenc` feature (LGPL-clean, NVIDIA GPU required at runtime) |
 | **QSV H.264 / HEVC encode (Intel oneVPL)** | Opt-in via `video-encoder-qsv` feature (LGPL-clean, x86_64 only, Intel iGPU + media driver required at runtime) |
 | **VAAPI H.264 / HEVC encode + decode** | Opt-in via `video-encoder-vaapi` / `video-decoder-vaapi` features (LGPL-clean via libva, Linux only). Fully wired: `AVHWDeviceContext` + `hw_frames_ctx` setup in `video-engine/src/vaapi.rs`; encoder accepts the broadcast contribution matrix (4:2:0 + 4:2:2 × 8-bit + 10-bit, mapped to NV12 / NV16 / P010LE / P210LE surfaces — 4:4:4 / NV24 deferred); decoder exports DRM PRIME descriptors for zero-copy KMS scanout. h264_vaapi is 4:2:0 8-bit only by spec; HEVC covers the full broadcast matrix on Intel iHD (Tiger Lake+). AMD radeonsi typically rejects 4:2:2 at `avcodec_open2`. |
+| **RKMPP H.264 / HEVC encode + decode** | Opt-in via `video-encoder-rkmpp` / `video-decoder-rkmpp` features (Rockchip MPP is LGPLv3; FFmpeg classifies it `version3`, so the build also passes `--enable-version3`). ARM Rockchip RK3568 / RK3588 only — there is no `rockchip_mpp` pkg-config module on x86_64 and `build.rs` aborts without it. Encode is **8-bit 4:2:0 only** (the VEPU has no 4:2:2, 4:4:4 or 10-bit encode path; `open()` rejects anything else with a named error). Decode natively emits `AV_PIX_FMT_DRM_PRIME` and `receive_frame()` downloads to sysmem NV12 unless the caller opts in via `set_rkmpp_zero_copy(true)`; no MPEG-2 decoder exists upstream for this backend. |
+| **NVDEC H.264 / HEVC / MPEG-2 decode** | Opt-in via `video-decoder-nvdec` (`h264_cuvid` / `hevc_cuvid` / `mpeg2_cuvid`, NV12 system memory, LGPL-clean, same `nv-codec-headers` build dep and NVIDIA driver as NVENC). |
+| **QSV H.264 / HEVC decode** | Opt-in via `video-decoder-qsv` (LGPL-clean, x86_64 only, same `libvpl-dev` build dep and Intel media driver as QSV encode). |
+
+The canonical per-backend / chroma / bit-depth / host-class matrix, with the
+verification commands for each host class, is `bilbycast-edge/docs/codec-matrix.md`
+— this table is the wrapper crate's build-time view of the same ground.
 
 ## Build & Test
 
@@ -81,6 +88,18 @@ cargo build -p video-engine --features video-encoder-qsv
 # (iHD driver) but oneVPL/QSV exposes more rate-control knobs there.
 sudo apt install libva-dev
 cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
+
+# NVIDIA NVDEC / Intel QSV hardware decode. Same build prerequisites as
+# their encoder siblings above (nv-codec-headers / libvpl-dev); the host
+# driver is what gates them at runtime.
+cargo build -p video-engine --features video-decoder-nvdec
+cargo build -p video-engine --features video-decoder-qsv
+
+# Rockchip RKMPP encode + decode (aarch64 RK3568 / RK3588 hosts only).
+# Needs librockchip-mpp-dev >= 1.3.8 (ships rockchip_mpp.pc) + libdrm-dev;
+# runtime needs the MPP kernel driver at /dev/mpp_service.
+sudo apt install librockchip-mpp-dev libdrm-dev
+cargo build -p video-engine --features video-encoder-rkmpp,video-decoder-rkmpp
 ```
 
 ### Prerequisites
@@ -93,19 +112,46 @@ cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 - **Optional encoder libraries (Linux)**:
   - `libx264-dev` when building with `video-encoder-x264` (GPL v2+)
   - `libx265-dev` when building with `video-encoder-x265` (GPL v2+)
-  - `nv-codec-headers` when building with `video-encoder-nvenc` (royalty-free, NVIDIA driver required at runtime)
-  - `libvpl-dev` when building with `video-encoder-qsv` (royalty-free, x86_64 only, Intel media driver + libvpl runtime required at runtime)
+  - `nv-codec-headers` when building with `video-encoder-nvenc` / `video-decoder-nvdec` (royalty-free, NVIDIA driver required at runtime)
+  - `libvpl-dev` when building with `video-encoder-qsv` / `video-decoder-qsv` (royalty-free, x86_64 only, Intel media driver + libvpl runtime required at runtime)
   - `libva-dev` when building with `video-encoder-vaapi` / `video-decoder-vaapi` (royalty-free, Linux only, working VAAPI driver — Mesa radeonsi for AMD or iHD for Intel — required at runtime)
+  - `librockchip-mpp-dev` (>= 1.3.8, ships `rockchip_mpp.pc`) + `libdrm-dev` when building with `video-encoder-rkmpp` / `video-decoder-rkmpp` (aarch64 Rockchip only — pkg-config finds no `rockchip_mpp` on x86_64 and `build.rs` panics; `/dev/mpp_service` required at runtime)
 
 ## Architecture
 
 ### Video Decoder (`video-engine/src/decoder.rs`)
 
 `VideoDecoder` wraps FFmpeg's `AVCodecContext`:
-- `open(codec)` — create decoder for H.264, HEVC, or MPEG-1/2
-- `send_packet(data)` — feed Annex B NAL unit data (or MPEG-2 elementary stream verbatim)
+- `open(codec)` — create a CPU decoder for H.264, HEVC, or MPEG-1/2
+- `open_threaded(codec)` — same, with libavcodec's automatic thread count
+- `open_with_backend(codec, DecoderBackend)` — pick the backend explicitly.
+  `DecoderBackend` has five variants: `Cpu` (always available), `Nvdec`
+  (`h264_cuvid` / `hevc_cuvid` / `mpeg2_cuvid`), `Qsv`, `Vaapi` and `Rkmpp`
+  (no MPEG-2 upstream), each behind its own `video-decoder-*` Cargo feature.
+  A HW backend fails with `CodecNotFound` when the feature is off and
+  `OpenCodec` when the host lacks the driver / hardware / permissions, so a
+  caller can demote to `Cpu` on the error rather than at build time
+- `backend()` — which backend this decoder actually opened with
+- `set_rkmpp_zero_copy(bool)` — `Vaapi` and `Rkmpp` are deliberately
+  asymmetric. `Vaapi` always yields hardware frames (the `*_planes()`
+  accessors return `None`), while `Rkmpp` decodes to `AV_PIX_FMT_DRM_PRIME`
+  and `receive_frame()` downloads it to sysmem NV12 by default, so it looks
+  like NVDEC / QSV to a transcode caller. Only the display path opts into the
+  raw DMA-BUF frames with this
+- `send_packet(data)` / `send_packet_with_pts(data, pts)` — feed Annex B NAL
+  unit data (or MPEG-2 elementary stream verbatim); the PTS variant rides the
+  stamp through libavcodec's reorder queue
 - `receive_frame()` → `DecodedFrame` with Y-plane access for luminance
+- `send_flush()` — signal end-of-stream so `receive_frame()` drains
 - `flush()` — reset decoder state
+
+`DecodedFrame` carries the hardware-frame surface alongside the sysmem
+accessors: `is_vaapi()` / `is_drm_prime()` classify it, `map_drm_prime()`
+exports a `DrmPrimeFrame` DMA-BUF descriptor (what bilbycast-edge's
+`engine::output_display` repacks into a `display::kms::DrmPrimeDescriptor` for
+the `drm` crate's `add_planar_framebuffer` — zero-copy KMS scanout),
+and `download_to_sysmem()` copies it back to a plain planar frame when a CPU
+consumer needs one.
 
 ### Video Scaler (`video-engine/src/scaler.rs`)
 
@@ -158,7 +204,7 @@ cargo build -p video-engine --features video-encoder-vaapi,video-decoder-vaapi
 
 **Feature-gated.** `VideoEncoder` wraps FFmpeg's `AVCodecContext` for
 H.264 / HEVC compression:
-- `open(config)` — backend selected by `VideoEncoderCodec::{X264, X265, H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi}`.
+- `open(config)` — backend selected by `VideoEncoderCodec::{X264, X265, H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi, H264Rkmpp, HevcRkmpp}`.
   Returns `EncoderDisabled` when the matching Cargo feature was not enabled at build.
 - `encode_frame(y, y_stride, u, u_stride, v, v_stride, pts)` — accepts
   planar YUV 4:2:0 / 4:2:2 (8 + 10-bit) planes with explicit strides. Returns
@@ -186,6 +232,43 @@ operators get a clear error, not opaque `avcodec_open2` EINVAL):
 | h264_vaapi | ✓ | ✗ | ✗ | ✗ | ✗ |
 | hevc_vaapi (Intel iHD) | ✓ | ✓ | ✓ | ✓ | ✗ (NV24 deferred) |
 | hevc_vaapi (AMD radeonsi) | ✓ | usually ✗ | ✓ | usually ✗ | ✗ |
+| h264_rkmpp / hevc_rkmpp | ✓ | ✗ | ✗ | ✗ | ✗ |
+
+RKMPP is the narrowest row deliberately: the Rockchip VEPU has no 4:2:2,
+no 4:4:4 and no 10-bit encode path (10-bit on RK3588 is decode-only), and
+`open()` rejects either up front so the edge auto-resolver can never land a
+10-bit / 4:2:2 request on it. Like QSV it is fed sysmem NV12 with **no**
+`hw_frames_ctx` — the FFmpeg wrapper auto-creates its own RKMPP device and
+copies each frame into an MPP/DRM buffer internally.
+
+### Hardware probe (`video-engine/src/probe.rs`)
+
+The public module behind bilbycast-edge's `engine::hardware_probe` and the
+`resource_budget` block it advertises on the health tick. Three tiers, all
+re-exported from the crate root:
+
+- **Availability** — `is_encoder_available(name)` / `is_decoder_available(name)`.
+  A registry lookup only (`avcodec_find_*_by_name`); it proves the codec was
+  compiled into the vendored FFmpeg, *not* that a session will open.
+- **Open probes** — `probe_open_encoder(name)`, `probe_open_encoder_chroma(name,
+  ProbeChroma)`, `probe_open_decoder(name)`, plus `probe_open_vaapi_encoder[_chroma]`,
+  which route through `VideoEncoder::open()` (hwdevice + frames-context setup)
+  and so return `NotCompiled` unless `video-encoder-vaapi` is on. These
+  actually run `avcodec_open2` at `PROBE_WIDTH` × `PROBE_HEIGHT` (320×240 —
+  above NVENC's 145-pixel minimum width and even-dimensioned for QSV). `(codec, chroma)` pairs the
+  backend definitely rejects return `ProbeError::NotCompiled` without attempting
+  an open, so a caller can fold "not in the matrix" and "not built" into one bit.
+- **Session capacity** — `count_max_encoder_sessions(name, upper_bound, w, h)`,
+  `count_max_decoder_sessions(...)` and the VAAPI-aware
+  `count_max_vaapi_encoder_sessions(...)`. Each holds every successful open until
+  the loop ends, so it measures the real concurrent cap (3–5 on consumer NVENC,
+  1–2 per VCN engine on AMD radeonsi) rather than a surface-pool artefact. Two
+  tiers of geometry ship as constants: `PROBE_WIDTH/HEIGHT_1080P` and
+  `PROBE_WIDTH/HEIGHT_4K` — capacity at 4K is materially lower and is reported
+  separately.
+
+`ProbeChroma` is the chroma + bit-depth axis (`Yuv420_8bit`, `Yuv422_8bit`,
+`Yuv420_10bit`, `Yuv422_10bit`) and `ProbeError` the result type.
 
 ### Thumbnail (`video-engine/src/thumbnail.rs`)
 
@@ -228,7 +311,7 @@ Output: raw encoded frames — Opus packets, MP2 frames, AC-3 frames.
 
 ## Integration with bilbycast-edge
 
-Feature-gated via `video-thumbnail` in bilbycast-edge (default on).
+Feature-gated via `media-codecs` in bilbycast-edge — `media-codecs = ["dep:video-engine", "dep:video-codec"]`, in the default set alongside `tls` / `webrtc` / `fdk-aac` / `replay` / `display`. Turning it off drops thumbnails, every non-AAC audio codec, and the universal CPU video decoder.
 
 **Video thumbnails:** `TsDemuxer` extracts NAL units → `decode_thumbnail()` via `spawn_blocking`.
 
@@ -236,4 +319,4 @@ Feature-gated via `video-thumbnail` in bilbycast-edge (default on).
 
 **HLS remuxing:** In-process TS audio remuxer decodes AAC → re-encodes to target codec → remuxes TS with video passthrough, replacing per-segment ffmpeg subprocess.
 
-**Video transcoding (Phase 4 MVP):** `VideoEncoder` — when the caller builds with `video-encoder-x264` / `video-encoder-x265` / `video-encoder-nvenc` — is driven from `bilbycast-edge/src/engine/ts_video_replace.rs` to re-encode H.264/HEVC elementary streams inside SRT / UDP / RTP outputs. RTMP / HLS / WebRTC video paths are **not yet wired**; see `bilbycast-edge/docs/transcoding.md` for the deferred-items list.
+**Video transcoding:** `VideoEncoder` — when the caller builds with any `video-encoder-*` feature (x264 / x265 / NVENC / QSV / VAAPI / RKMPP) — is driven from `bilbycast-edge/src/engine/ts_video_replace.rs` to re-encode H.264/HEVC elementary streams inside SRT / UDP / RTP outputs. RTMP, WebRTC and CMAF-LL are wired too, each building an `engine::video_encode_util::ScaledVideoEncoder` from the output's own `video_encode` config: `output_rtmp.rs` (`VideoEncoderState` + `init_video_encoder_state`), `output_webrtc.rs` (`WebrtcVideoEncoderState`, H.264-only — codec strings `x264` / `h264_nvenc` / `h264_qsv` / `h264_vaapi` / `h264_rkmpp`, with `auto` resolved through `engine::hardware_probe` and an HEVC resolution rejected outright because browsers won't decode it) and `cmaf/encode.rs`. Only the legacy `output_hls.rs` segment path is still unwired for video — it handles `audio_encode` alone; see `bilbycast-edge/docs/transcoding.md` for the deferred-items list.
