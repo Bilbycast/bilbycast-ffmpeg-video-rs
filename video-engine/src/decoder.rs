@@ -788,13 +788,17 @@ impl VideoDecoder {
         Self::open_inner(codec, DecoderBackend::Cpu, false)
     }
 
-    /// Open a software decoder with libavcodec auto-threading (frame +
-    /// slice, `thread_count = 0`). Trades a constant pipeline delay of
-    /// up to `thread_count` frames for multi-core decode throughput.
-    /// Use on throughput-bound paths (ST 2110-20/-23 uncompressed
-    /// egress, where UHD HEVC decode must sustain the full frame rate),
-    /// NOT on latency-sensitive consumers (local display, in-place
-    /// transcode) where the added decode latency shifts A/V alignment.
+    /// Open a software decoder with libavcodec auto-threading
+    /// (`thread_count = 0`). libavcodec resolves that to **frame**
+    /// threading — `thread_type` allows slice threading too, but H.264 and
+    /// HEVC pick frame threading whenever it is allowed, and it stays
+    /// allowed because `AV_CODEC_FLAG2_CHUNKS` is off. Trades a constant
+    /// pipeline delay of up to `thread_count` frames for multi-core decode
+    /// throughput. Use on throughput-bound paths (ST 2110-20/-23
+    /// uncompressed egress, where UHD HEVC decode must sustain the full
+    /// frame rate), NOT on latency-sensitive consumers (local display,
+    /// in-place transcode) where the added decode latency shifts A/V
+    /// alignment.
     pub fn open_threaded(codec: VideoCodec) -> Result<Self, VideoError> {
         Self::open_inner(codec, DecoderBackend::Cpu, true)
     }
@@ -861,18 +865,30 @@ impl VideoDecoder {
                 return Err(VideoError::AllocContext);
             }
 
-            // Allow truncated packets (common in TS streams). Safe on
-            // the cuvid / QSV decoders too — they buffer NAL units
-            // internally and tolerate the same partial-packet feeding
-            // pattern as the SW decoder.
-            (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
+            // AV_CODEC_FLAG2_CHUNKS (1 << 15) must stay OFF. Until
+            // 2026-09 this line set `flags2 |= 1 << 1` under a comment
+            // claiming CHUNKS; bit 1 of flags2 is unassigned, so it was a
+            // no-op in every release and CHUNKS was never on. Do not
+            // "correct" it to the real constant:
+            //   - libavcodec refuses frame threading when CHUNKS is set
+            //     (pthread.c), silently turning `open_threaded` into slice
+            //     threading, which also force-disables H.264 error
+            //     resilience (h264dec.c) and gains nothing on broadcast
+            //     captures (measured: Nine 341 -> 333 fps);
+            //   - the edge always feeds whole access units / PES payloads,
+            //     which is what CHUNKS-off assumes;
+            //   - real CHUNKS changed the decoded output on astra and Nine
+            //     and wedged astra after 31 of 1495 frames.
+            // `open_threaded_uses_frame_threading` pins this.
 
             // libavcodec defaults to thread_count = 1 (single-threaded).
             // Must be set before avcodec_open2. CPU backend only — HW
             // decoders manage their own session parallelism.
             if auto_threads && backend == DecoderBackend::Cpu {
                 (*ctx).thread_count = 0; // auto: one per core, capped by FFmpeg
-                (*ctx).thread_type = 3; // FF_THREAD_FRAME | FF_THREAD_SLICE
+                // FF_THREAD_FRAME | FF_THREAD_SLICE: libavcodec picks frame
+                // threading (see `open_threaded`).
+                (*ctx).thread_type = 3;
             }
 
             // VAAPI: open a hwdevice on the default render node, hand a
@@ -931,6 +947,14 @@ impl VideoDecoder {
     /// name.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// libavcodec's `AVCodecContext.active_thread_type` after open: 0 single
+    /// threaded, 1 `FF_THREAD_FRAME`, 2 `FF_THREAD_SLICE`. Exposed so a test
+    /// can pin the threading decision (see `open_threaded`).
+    #[doc(hidden)]
+    pub fn active_thread_type(&self) -> i32 {
+        unsafe { (*self.ctx).active_thread_type }
     }
 
     /// Opt in to zero-copy RKMPP display output: `receive_frame()`
@@ -1315,6 +1339,26 @@ mod tests {
             // through to the right branch.
             let frame = synthetic_frame(AVPixelFormat_AV_PIX_FMT_P010LE, 16, 8);
             assert!(frame.p21x_planes().is_none());
+        }
+    }
+
+    /// `FF_THREAD_FRAME`, as libavcodec reports it in `active_thread_type`.
+    const FF_THREAD_FRAME: i32 = 1;
+
+    #[test]
+    fn open_threaded_uses_frame_threading() {
+        // Pins the threading decision `open_threaded` documents, and with it
+        // the CHUNKS note in `open_inner`: setting the real
+        // AV_CODEC_FLAG2_CHUNKS (1 << 15) makes libavcodec refuse frame
+        // threading, and this reads 2 (slice) instead. Auto thread_count is
+        // min(nb_cpus + 1, 16) >= 2 even on a one-CPU runner, so frame
+        // threading is always active here.
+        init();
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let threaded = VideoDecoder::open_threaded(codec).unwrap();
+            assert_eq!(threaded.active_thread_type(), FF_THREAD_FRAME, "{codec}");
+            let single = VideoDecoder::open(codec).unwrap();
+            assert_eq!(single.active_thread_type(), 0, "{codec}");
         }
     }
 

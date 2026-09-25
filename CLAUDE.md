@@ -123,7 +123,14 @@ cargo build -p video-engine --features video-encoder-rkmpp,video-decoder-rkmpp
 
 `VideoDecoder` wraps FFmpeg's `AVCodecContext`:
 - `open(codec)` — create a CPU decoder for H.264, HEVC, or MPEG-1/2
-- `open_threaded(codec)` — same, with libavcodec's automatic thread count
+- `open_threaded(codec)` — same, with libavcodec's automatic thread count,
+  which resolves to **frame** threading (`active_thread_type == 1`)
+- **`AV_CODEC_FLAG2_CHUNKS` stays off.** Until 2026-09 `open_inner` and the
+  decoder probe set `flags2 |= 1 << 1` under a CHUNKS comment; bit 1 is
+  unassigned, so it was a no-op in every release. The real flag (`1 << 15`)
+  makes libavcodec refuse frame threading (silent slice threading, which also
+  disables H.264 error resilience) and changed decoded output on the rig.
+  `open_threaded_uses_frame_threading` pins it
 - `open_with_backend(codec, DecoderBackend)` — pick the backend explicitly.
   `DecoderBackend` has five variants: `Cpu` (always available), `Nvdec`
   (`h264_cuvid` / `hevc_cuvid` / `mpeg2_cuvid`), `Qsv`, `Vaapi` and `Rkmpp`

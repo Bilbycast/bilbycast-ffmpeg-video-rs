@@ -673,9 +673,9 @@ unsafe fn try_open_decoder_context(
     if ctx.is_null() {
         return Err(ProbeError::AllocFailed);
     }
-    // Allow truncated packets (matches VideoDecoder's open path) so the
-    // probe is consistent with how decoders are used at runtime.
-    (*ctx).flags2 |= 1 << 1; // AV_CODEC_FLAG2_CHUNKS
+    // No AV_CODEC_FLAG2_CHUNKS, matching `VideoDecoder`'s open path (see the
+    // note in `decoder.rs`: the `1 << 1` this used to set is an unassigned
+    // bit, and real CHUNKS would disable frame threading).
     (*ctx).time_base.num = 1;
     (*ctx).time_base.den = PROBE_FPS_NUM;
     if width > 0 && height > 0 {
