@@ -188,7 +188,7 @@ fn translate_profile_for_backend(codec: VideoEncoderCodec, profile: &str) -> Opt
     // chroma and bit depth other than 4:2:0 8-bit.
     //
     // Worth knowing before extending the table: on the vendored FFmpeg
-    // (n9.0.1) the value never reaches the encoder. `rkmpp_init_encoder`
+    // (n9.0.2) the value never reaches the encoder. `rkmpp_init_encoder`
     // neither reads `avctx->profile` nor sets `h264:profile` on the
     // `MppEncCfg`, so MPP encodes at its own default whatever is asked for.
     // The mapping is here to keep `avcodec_open2` from failing, and to be

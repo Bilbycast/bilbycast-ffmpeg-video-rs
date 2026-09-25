@@ -65,7 +65,7 @@ fn main() {
         // field it replaces. bindgen emits nothing for an allowlisted symbol
         // the headers don't declare, so an older system FFmpeg would fail at
         // link/resolve time rather than here — state the real floor instead.
-        // (The vendored build is unaffected; it is n9.0.1.)
+        // (The vendored build is unaffected; it is n9.0.2.)
         let avcodec = pkg_config::Config::new()
             .atleast_version("61.13.100")
             .probe("libavcodec")

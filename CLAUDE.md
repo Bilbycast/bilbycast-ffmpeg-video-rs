@@ -14,7 +14,7 @@ Rust wrapper around FFmpeg's libavcodec, libavutil, libswscale, and libopus for 
 
 | Crate | Role |
 |-------|------|
-| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n9.0.1) + `libffmpeg-video-sys/vendor/opus` (v1.6.1). The `system-ffmpeg` alternative needs libavcodec >= 61.13.100 (FFmpeg 7.1) — `probe.rs` calls `avcodec_get_supported_config()`, since n9.0 deletes the `AVCodec::pix_fmts` field it replaces. |
+| **libffmpeg-video-sys** | Raw FFI bindings to FFmpeg via bindgen. Vendored build from `libffmpeg-video-sys/vendor/ffmpeg` (n9.0.2) + `libffmpeg-video-sys/vendor/opus` (v1.6.1). The `system-ffmpeg` alternative needs libavcodec >= 61.13.100 (FFmpeg 7.1) — `probe.rs` calls `avcodec_get_supported_config()`, since n9.0 deletes the `AVCodec::pix_fmts` field it replaces. |
 | **video-codec** | Pure-Rust data types (video/audio codec enums, errors, config). No C dependency. |
 | **video-engine** | Safe wrapper — `VideoDecoder`, `VideoScaler`, `JpegEncoder`, `AudioDecoder`, `AudioEncoder`, `VideoEncoder` (feature-gated), `decode_thumbnail()`, plus the equally public `probe` (host encoder/decoder availability + session-capacity probes) and `vaapi` (`VaapiDevice`, `hw_frames_ctx` allocation, DRM PRIME export) modules. The crate bilbycast-edge depends on. |
 
