@@ -377,6 +377,14 @@ Returns `ThumbnailResult { jpeg, luminance, source_width, source_height }`.
 - `encode_frame(planar_f32)` → `Vec<EncodedAudioFrame>` (raw codec frames, no container)
 - `flush()` — drain buffered frames
 - `frame_size()` — samples per frame for caller's accumulation buffer
+- `initial_padding()` — the encoder delay in samples (MP2 481, AC-3 256, Opus
+  312 at 48 kHz): input sample `n` decodes at output sample
+  `n + initial_padding()`. A caller that stamps wire PTS from the PTS of the
+  first input sample must subtract it (MP2 10.0 ms, AC-3 5.3 ms late
+  otherwise); a round-trip test pins the lag against libavcodec's decoders
+- `EncodedAudioFrame::pts` — libavcodec's packet pts in samples from the first
+  input sample, already minus `initial_padding()` (so the first packet is
+  negative)
 
 Input: planar f32 PCM (matching bilbycast-edge's audio pipeline).
 Output: raw encoded frames — Opus packets, MP2 frames, AC-3 frames.

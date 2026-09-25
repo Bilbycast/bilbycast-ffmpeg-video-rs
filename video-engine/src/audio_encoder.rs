@@ -28,6 +28,16 @@ pub struct EncodedAudioFrame {
     pub data: Bytes,
     /// Number of PCM samples per channel that produced this frame.
     pub num_samples: usize,
+    /// Presentation timestamp libavcodec stamped on the packet, in samples
+    /// at [`AudioEncoder::sample_rate`], counted from the first sample fed
+    /// to [`AudioEncoder::encode_frame`] (index 0). It already has the
+    /// encoder delay subtracted, so the first packet is stamped
+    /// `-initial_padding()`: the packet whose decoded output starts at
+    /// sample `pts` of the input timeline. A caller that stamps a wire PTS
+    /// from its own input clock must subtract
+    /// [`AudioEncoder::initial_padding`] too, or every frame presents that
+    /// many samples late.
+    pub pts: i64,
 }
 
 /// Safe audio encoder wrapping FFmpeg's AVCodecContext.
@@ -42,6 +52,9 @@ pub struct AudioEncoder {
     channels: u8,
     /// Monotonic frame counter for pts assignment.
     frame_count: i64,
+    /// `AVCodecContext.initial_padding` after open — the encoder delay in
+    /// samples at `sample_rate`.
+    initial_padding: usize,
 }
 
 // SAFETY: AVCodecContext is per-instance with no shared global state.
@@ -114,6 +127,10 @@ impl AudioEncoder {
             };
 
             let actual_sample_rate = (*ctx).sample_rate as u32;
+            // Encoder delay ("priming"), set by the codec at open: MP2 481
+            // (512 - 32 + 1, mpegaudioenc.c), AC-3 256 (one block,
+            // ac3enc.c), libopus its OPUS_GET_LOOKAHEAD (312 at 48 kHz).
+            let initial_padding = (*ctx).initial_padding.max(0) as usize;
 
             // Allocate reusable frame
             let frame = av_frame_alloc();
@@ -151,6 +168,7 @@ impl AudioEncoder {
                 sample_rate: actual_sample_rate,
                 channels: config.channels,
                 frame_count: 0,
+                initial_padding,
             })
         }
     }
@@ -168,6 +186,20 @@ impl AudioEncoder {
     /// The codec this encoder was opened for.
     pub fn codec(&self) -> AudioCodecType {
         self.codec
+    }
+
+    /// Encoder delay in samples at [`Self::sample_rate`]: how far the decoded
+    /// output lags the input. The first `initial_padding()` decoded samples
+    /// are priming, and input sample `n` decodes at output sample
+    /// `n + initial_padding()` — MP2 481, AC-3 256, Opus 312 (at 48 kHz).
+    ///
+    /// libavcodec's own packet timestamps already account for it (see
+    /// [`EncodedAudioFrame::pts`]). A caller that instead stamps packets from
+    /// the PTS of the first input sample it fed must subtract
+    /// `initial_padding() * 90_000 / sample_rate()` ticks, or the audio
+    /// presents that much late against the video it was captured with.
+    pub fn initial_padding(&self) -> usize {
+        self.initial_padding
     }
 
     /// Encode one frame of planar f32 PCM audio.
@@ -266,6 +298,7 @@ impl AudioEncoder {
                 frames.push(EncodedAudioFrame {
                     data: Bytes::copy_from_slice(data),
                     num_samples: self.frame_size,
+                    pts: (*self.packet).pts,
                 });
             }
             Ok(frames)
@@ -292,6 +325,7 @@ impl AudioEncoder {
             frames.push(EncodedAudioFrame {
                 data: Bytes::copy_from_slice(data),
                 num_samples: self.frame_size,
+                pts: (*self.packet).pts,
             });
         }
 
@@ -445,6 +479,126 @@ mod tests {
         total_encoded += flush_frames.len();
 
         assert!(total_encoded > 0);
+    }
+
+    fn open(codec: AudioCodecType) -> AudioEncoder {
+        AudioEncoder::open(&AudioEncoderConfig {
+            codec,
+            sample_rate: 48000,
+            channels: 2,
+            bitrate_kbps: 192,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn initial_padding_is_the_codec_declared_delay() {
+        // mpegaudioenc.c: 512 - 32 + 1; ac3enc.c: AC3_BLOCK_SIZE; libopus:
+        // OPUS_GET_LOOKAHEAD at 48 kHz (2.5 ms + 4 ms).
+        init();
+        assert_eq!(open(AudioCodecType::Mp2).initial_padding(), 481);
+        assert_eq!(open(AudioCodecType::Ac3).initial_padding(), 256);
+        assert_eq!(open(AudioCodecType::Opus).initial_padding(), 312);
+    }
+
+    #[test]
+    fn packet_pts_is_input_position_minus_padding() {
+        // libavcodec stamps each packet at (first input sample it covers) -
+        // initial_padding, in samples. The first one is therefore negative:
+        // that is the priming a receiver must not present.
+        init();
+        for codec in [AudioCodecType::Mp2, AudioCodecType::Ac3, AudioCodecType::Opus] {
+            let mut enc = open(codec);
+            let fs = enc.frame_size();
+            let pad = enc.initial_padding() as i64;
+            let silence = vec![vec![0.0f32; fs]; 2];
+            let mut pts = Vec::new();
+            for _ in 0..6 {
+                pts.extend(enc.encode_frame(&silence).unwrap().iter().map(|f| f.pts));
+            }
+            pts.extend(enc.flush().unwrap().iter().map(|f| f.pts));
+            assert!(!pts.is_empty(), "{codec}");
+            assert_eq!(pts[0], -pad, "{codec}: first packet pts");
+            for w in pts.windows(2) {
+                assert_eq!(w[1] - w[0], fs as i64, "{codec}: packet spacing");
+            }
+        }
+    }
+
+    /// Encode silence with a short band-limited tone burst starting at input
+    /// sample `at`, decode it with libavcodec, and return the decoded sample
+    /// index where the burst correlates best.
+    fn round_trip_burst_position(codec: AudioCodecType, at: usize) -> usize {
+        use crate::audio_decoder::AudioDecoder;
+        use video_codec::AudioDecoderCodec;
+
+        let mut enc = open(codec);
+        let fs = enc.frame_size();
+        let burst: Vec<f32> = (0..480)
+            .map(|k| {
+                let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / 479.0).cos();
+                0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / 48000.0).sin()
+            })
+            .collect();
+        let total = fs * 20;
+        let mut signal = vec![0.0f32; total];
+        signal[at..at + burst.len()].copy_from_slice(&burst);
+
+        let mut packets = Vec::new();
+        for chunk in signal.chunks(fs) {
+            let planar = vec![chunk.to_vec(), chunk.to_vec()];
+            packets.extend(enc.encode_frame(&planar).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+
+        let mut dec = AudioDecoder::open(match codec {
+            AudioCodecType::Mp2 => AudioDecoderCodec::Mp2,
+            AudioCodecType::Ac3 => AudioDecoderCodec::Ac3,
+            AudioCodecType::Opus => AudioDecoderCodec::Opus,
+        })
+        .unwrap();
+        let mut decoded = Vec::new();
+        for p in &packets {
+            dec.send_packet(&p.data, p.pts).unwrap();
+            while let Ok(f) = dec.receive_frame() {
+                decoded.extend_from_slice(&f.planar[0]);
+            }
+        }
+        assert!(decoded.len() > at + 4000, "{codec}: decoded {} samples", decoded.len());
+
+        (0..4000)
+            .max_by(|&a, &b| {
+                let score = |lag: usize| -> f32 {
+                    burst
+                        .iter()
+                        .zip(&decoded[at + lag..])
+                        .map(|(x, y)| x * y)
+                        .sum()
+                };
+                score(a).total_cmp(&score(b))
+            })
+            .map(|lag| at + lag)
+            .unwrap()
+    }
+
+    #[test]
+    fn round_trip_lag_equals_initial_padding() {
+        // The whole encode + decode delay of a libavcodec MP2 / AC-3 chain is
+        // the encoder's declared padding (their decoders add none), which is
+        // what a caller stamping wire PTS from its input clock has to take
+        // off. Without it, re-encoded audio presents 10.0 ms (MP2) / 5.3 ms
+        // (AC-3) late at 48 kHz.
+        init();
+        for codec in [AudioCodecType::Mp2, AudioCodecType::Ac3] {
+            let at = 4800;
+            let found = round_trip_burst_position(codec, at);
+            let lag = found as i64 - at as i64;
+            let pad = open(codec).initial_padding() as i64;
+            assert!(
+                (lag - pad).abs() <= 2,
+                "{codec}: round-trip lag {lag} samples vs initial_padding {pad}"
+            );
+        }
     }
 
     #[test]
