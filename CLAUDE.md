@@ -125,6 +125,28 @@ cargo build -p video-engine --features video-encoder-rkmpp,video-decoder-rkmpp
 - `open(codec)` — create a CPU decoder for H.264, HEVC, or MPEG-1/2
 - `open_threaded(codec)` — same, with libavcodec's automatic thread count,
   which resolves to **frame** threading (`active_thread_type == 1`)
+- `open_opts(codec, DecoderOptions { backend, threading, reorder_seed })` —
+  every option explicit. `open`, `open_threaded` and `open_with_backend` are
+  wrappers over it with `reorder_seed: ReorderSeed::LibavcodecDefault`, so
+  their behaviour is unchanged. `ReorderSeed::FromAccessUnit(au)` seeds an
+  H.264 decoder's `has_b_frames` before `avcodec_open2` (Cpu and Vaapi
+  backends only; HEVC / MPEG-2 / NVDEC / QSV / RKMPP ignore it): **0** when
+  the AU's SPS declares `max_num_reorder_frames` (libavcodec applies the
+  declared depth itself, before gap handling — including 0 for x264
+  `zerolatency` output), **1** otherwise. Without it, a mid-stream join on a
+  non-IDR I picture of a stream with no VUI `bitstream_restriction` (14 of the
+  18 broadcast captures on the rig) lets libavcodec's unmarked-random-access
+  heuristic (`h264_refs.c`) fire on the synthesised frame-num-gap
+  placeholders, which are then never greyed nor swapped for a real reference
+  — a whole GOP of garbage on Sky Sports. Costs one frame of latency on an
+  IPPP stream whose SPS declares nothing. Does **not** recover the 1-3
+  decodable leading B-pictures a join on an undeclared depth-≥2 stream still
+  drops once (seeding the level DPB would, at permanent extra latency).
+  Callers that open lazily on the triggering AU should pass it
+- `reorder_depth()` — the current `has_b_frames` (seed, then whatever
+  libavcodec learns; it only grows). `flush()` does **not** reset it and
+  cannot re-seed (frame-thread workers never re-read it), so a decoder that
+  switches to a different source is dropped and reopened with `open_opts`
 - **`AV_CODEC_FLAG2_CHUNKS` stays off.** Until 2026-09 `open_inner` and the
   decoder probe set `flags2 |= 1 << 1` under a CHUNKS comment; bit 1 is
   unassigned, so it was a no-op in every release. The real flag (`1 << 15`)
@@ -159,6 +181,24 @@ exports a `DrmPrimeFrame` DMA-BUF descriptor (what bilbycast-edge's
 the `drm` crate's `add_planar_framebuffer` — zero-copy KMS scanout),
 and `download_to_sysmem()` copies it back to a plain planar frame when a CPU
 consumer needs one.
+
+### H.264 SPS parser (`video-engine/src/h264_sps.rs`)
+
+Pure Rust, no FFI. `parse_h264_sps(nal)` / `find_h264_sps(annexb)` →
+`H264SpsInfo` (profile / level, chroma format, bit depth, `frame_mbs_only`,
+`mb_adaptive_frame_field`, cropped width / height, VUI sample aspect ratio,
+timing, NAL HRD presence, `pic_struct_present`, `max_num_reorder_frames`), and
+`h264_declared_reorder_depth(annexb)` for the decoder seed above.
+`annexb_nal_units` iterates an Annex B buffer. It mirrors libavcodec n9.0.2's
+`ff_h264_decode_seq_parameter_set` rather than the letter of the spec where
+they differ (libavcodec's profile list for the chroma branch; every SPS it
+refuses parses to `None`; the reader stops at the `rbsp_stop_one_bit`, and any
+overread leaves the reorder depth undeclared), because a depth libavcodec did
+not apply would reproduce the join bug while an undeclared one only costs a
+frame. Tested on SPS bytes cut from the rig's captures (Nine 3, Seven 3,
+sync-test 2, BTS204 2, Sky Sports / Sky Witness / ABC none, x264 0 / 1) with
+FFmpeg's `trace_headers` as the oracle, plus every truncation and every
+single-bit flip.
 
 ### Video Scaler (`video-engine/src/scaler.rs`)
 

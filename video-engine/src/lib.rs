@@ -13,6 +13,10 @@
 //!
 //! - [`decode_thumbnail`] — End-to-end: NAL units in, JPEG bytes out
 //!
+//! Plus a pure-Rust H.264 SPS reader, [`h264_sps`] — what
+//! [`VideoDecoder::open_opts`] uses to decide its reorder seed, and what a
+//! test uses to read an encoder's interlace / aspect-ratio signalling back.
+//!
 //! All FFI calls are encapsulated behind safe Rust APIs. The types are `Send`
 //! but not `Sync` (same pattern as `AacDecoder` in bilbycast-fdk-aac-rs).
 
@@ -20,6 +24,7 @@ pub mod audio_decoder;
 pub mod audio_encoder;
 pub mod decoder;
 pub mod encoder;
+pub mod h264_sps;
 pub mod probe;
 pub mod scaler;
 pub mod thumbnail;
@@ -28,7 +33,12 @@ pub mod video_encoder;
 
 pub use audio_decoder::{AudioDecoder, DecodedAudioFrame};
 pub use audio_encoder::AudioEncoder;
-pub use decoder::{DecodedFrame, DecoderBackend, VideoDecoder};
+pub use decoder::{
+    DecodedFrame, DecoderBackend, DecoderOptions, DecoderThreading, ReorderSeed, VideoDecoder,
+};
+pub use h264_sps::{
+    annexb_nal_units, find_h264_sps, h264_declared_reorder_depth, parse_h264_sps, H264SpsInfo,
+};
 pub use vaapi::{
     allocate_hw_frames_ctx, map_vaapi_to_drm_prime, DrmPrimeFrame, DrmPrimeKeepalive,
     DrmPrimePlane, VaapiDevice,

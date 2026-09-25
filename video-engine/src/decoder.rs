@@ -45,9 +45,10 @@ use crate::vaapi::{
 /// DMA-BUF descriptor for KMS scanout. The `*_planes` accessors return
 /// `None` for VAAPI frames — there's no system-memory pixel data to
 /// drain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecoderBackend {
     /// libavcodec software decoder. Always available.
+    #[default]
     Cpu,
     /// NVIDIA NVDEC via `h264_cuvid` / `hevc_cuvid`. Needs the
     /// `video-decoder-nvdec` Cargo feature.
@@ -95,6 +96,109 @@ impl DecoderBackend {
             (DecoderBackend::Rkmpp, VideoCodec::Mpeg2) => None,
         }
     }
+}
+
+/// Threading for [`VideoDecoder::open_opts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoderThreading {
+    /// One decode thread — libavcodec's default, and what
+    /// [`VideoDecoder::open`] / [`VideoDecoder::open_with_backend`] use.
+    #[default]
+    Single,
+    /// libavcodec's automatic thread count with **frame** threading — what
+    /// [`VideoDecoder::open_threaded`] uses. `DecoderBackend::Cpu` only; the
+    /// hardware backends manage their own parallelism and ignore it.
+    ///
+    /// Frame threading costs a constant pipeline delay of up to
+    /// `thread_count` frames. It needs whole access units per packet, which is
+    /// also why `AV_CODEC_FLAG2_CHUNKS` must stay off (see `open_inner`).
+    Auto,
+}
+
+/// How [`VideoDecoder::open_opts`] seeds an H.264 decoder's reorder depth —
+/// `AVCodecContext.has_b_frames`, the number of frames libavcodec holds back
+/// to put pictures into display order — before `avcodec_open2`.
+///
+/// # Why a seed
+///
+/// libavcodec starts every H.264 decoder at `has_b_frames = 0` and, for a
+/// stream whose SPS carries no VUI `bitstream_restriction` (most broadcast
+/// captures), only learns the real depth by seeing pictures arrive out of
+/// order. At a mid-stream join on a non-IDR I picture that heuristic goes
+/// wrong: the `frame_num` gap before the I is filled with synthesised
+/// placeholder references, and while `has_b_frames` is still 0 the
+/// unmarked-random-access heuristic (`h264_refs.c`, `if
+/// (!h->avctx->has_b_frames) h->frame_recovered |= ...`) fires *on those
+/// placeholders*. They are then treated as recovered: never painted grey,
+/// never swapped for a real reference by `noref_gray`, so every P / B of the
+/// join GOP that reaches behind the I reads uninitialised memory — a whole
+/// GOP of garbage on Sky Sports-style PAFF feeds. Seeding 1 keeps the
+/// heuristic from firing and the placeholders grey.
+///
+/// The seed has to be set before open: frame-thread workers copy the context
+/// at `avcodec_open2` and never read `has_b_frames` from it again.
+///
+/// # What it does not fix
+///
+/// On a stream whose true depth is 2 or more and that declares none, a join
+/// can still drop 1-3 decodable leading B-pictures once, until libavcodec's
+/// heuristic has learned the depth. Seeding the level-derived DPB size
+/// would avoid that at the price of permanent extra latency, so it is not
+/// done. `VideoDecoder::flush()` does not reset the learned depth either — a
+/// decoder that must re-seed for a new source is dropped and reopened.
+///
+/// Only H.264 on `DecoderBackend::Cpu` and `DecoderBackend::Vaapi` (the
+/// native decoder with a hwaccel attached) is seeded. HEVC always signals
+/// `sps_max_num_reorder_pics`, MPEG-2 has `low_delay`, and NVDEC / QSV /
+/// RKMPP are standalone decoders with their own reorder logic; they ignore
+/// the seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReorderSeed<'a> {
+    /// Leave libavcodec's default of 0. What [`VideoDecoder::open`],
+    /// [`VideoDecoder::open_threaded`] and [`VideoDecoder::open_with_backend`]
+    /// do, unchanged.
+    #[default]
+    LibavcodecDefault,
+    /// Seed from the Annex B access unit that triggered the open: 0 when its
+    /// SPS declares `max_num_reorder_frames` (libavcodec then applies the
+    /// declared depth itself, before any gap handling — including 0 for the
+    /// IPPP streams x264 `zerolatency` produces), 1 otherwise, including when
+    /// the AU carries no parsable SPS. See
+    /// [`crate::h264_declared_reorder_depth`].
+    FromAccessUnit(&'a [u8]),
+    /// An explicit seed — for tests and diagnostics.
+    Frames(u8),
+}
+
+impl ReorderSeed<'_> {
+    /// The `has_b_frames` value this seed installs, or `None` to leave
+    /// libavcodec's default in place.
+    pub fn resolve(self) -> Option<i32> {
+        match self {
+            ReorderSeed::LibavcodecDefault => None,
+            ReorderSeed::FromAccessUnit(au) => {
+                Some(if crate::h264_sps::h264_declared_reorder_depth(au).is_some() {
+                    0
+                } else {
+                    1
+                })
+            }
+            ReorderSeed::Frames(n) => Some(n as i32),
+        }
+    }
+}
+
+/// Everything [`VideoDecoder::open_opts`] takes besides the codec. The
+/// `Default` is the plain single-threaded CPU decoder with libavcodec's own
+/// reorder default — exactly [`VideoDecoder::open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecoderOptions<'a> {
+    /// Decoder family. See [`DecoderBackend`].
+    pub backend: DecoderBackend,
+    /// Thread model. See [`DecoderThreading`].
+    pub threading: DecoderThreading,
+    /// H.264 reorder-depth seed. See [`ReorderSeed`].
+    pub reorder_seed: ReorderSeed<'a>,
 }
 
 /// AVERROR_EOF = -FFERRTAG('E','O','F',' ')
@@ -783,9 +887,13 @@ unsafe impl Send for VideoDecoder {}
 impl VideoDecoder {
     /// Open a software (libavcodec) decoder for the specified video codec.
     ///
-    /// Equivalent to [`open_with_backend`] with `DecoderBackend::Cpu`.
+    /// Equivalent to [`open_with_backend`] with `DecoderBackend::Cpu`, and to
+    /// [`Self::open_opts`] with `DecoderOptions::default()` — no H.264
+    /// reorder seed. A caller that opens on a stream's first access unit
+    /// should prefer `open_opts` with [`ReorderSeed::FromAccessUnit`], which
+    /// makes a mid-stream join on a non-IDR I picture decode cleanly.
     pub fn open(codec: VideoCodec) -> Result<Self, VideoError> {
-        Self::open_inner(codec, DecoderBackend::Cpu, false)
+        Self::open_opts(codec, DecoderOptions::default())
     }
 
     /// Open a software decoder with libavcodec auto-threading
@@ -799,8 +907,17 @@ impl VideoDecoder {
     /// frame rate), NOT on latency-sensitive consumers (local display,
     /// in-place transcode) where the added decode latency shifts A/V
     /// alignment.
+    ///
+    /// Equivalent to [`Self::open_opts`] with
+    /// `threading: DecoderThreading::Auto` and no reorder seed.
     pub fn open_threaded(codec: VideoCodec) -> Result<Self, VideoError> {
-        Self::open_inner(codec, DecoderBackend::Cpu, true)
+        Self::open_opts(
+            codec,
+            DecoderOptions {
+                threading: DecoderThreading::Auto,
+                ..DecoderOptions::default()
+            },
+        )
     }
 
     /// Open a decoder for the specified video codec, selecting the
@@ -816,13 +933,47 @@ impl VideoDecoder {
         codec: VideoCodec,
         backend: DecoderBackend,
     ) -> Result<Self, VideoError> {
-        Self::open_inner(codec, backend, false)
+        Self::open_opts(
+            codec,
+            DecoderOptions {
+                backend,
+                ..DecoderOptions::default()
+            },
+        )
+    }
+
+    /// Open a decoder with every option explicit: backend, thread model and
+    /// H.264 reorder seed. [`Self::open`], [`Self::open_threaded`] and
+    /// [`Self::open_with_backend`] are wrappers over this that leave the
+    /// seed at [`ReorderSeed::LibavcodecDefault`], so their behaviour is
+    /// unchanged.
+    ///
+    /// Callers that open lazily on the access unit that triggered the open —
+    /// every transcode, display, SDI, ST 2110, MXL, mosaic, CMAF, RTMP and
+    /// WebRTC path in bilbycast-edge — should pass that AU as
+    /// `reorder_seed: ReorderSeed::FromAccessUnit(au)`; see [`ReorderSeed`]
+    /// for what it fixes and what it costs (one frame of latency on an IPPP
+    /// stream whose SPS declares no reorder depth).
+    pub fn open_opts(codec: VideoCodec, opts: DecoderOptions<'_>) -> Result<Self, VideoError> {
+        let seed = match (codec, opts.backend) {
+            (VideoCodec::H264, DecoderBackend::Cpu | DecoderBackend::Vaapi) => {
+                opts.reorder_seed.resolve()
+            }
+            _ => None,
+        };
+        Self::open_inner(
+            codec,
+            opts.backend,
+            opts.threading == DecoderThreading::Auto,
+            seed,
+        )
     }
 
     fn open_inner(
         codec: VideoCodec,
         backend: DecoderBackend,
         auto_threads: bool,
+        has_b_frames_seed: Option<i32>,
     ) -> Result<Self, VideoError> {
         unsafe {
             let av_codec = match backend {
@@ -891,6 +1042,13 @@ impl VideoDecoder {
                 (*ctx).thread_type = 3;
             }
 
+            // H.264 reorder-depth seed (see `ReorderSeed`). Before
+            // avcodec_open2, because frame-thread workers memdup the
+            // context at open and never read has_b_frames from it again.
+            if let Some(seed) = has_b_frames_seed {
+                (*ctx).has_b_frames = seed;
+            }
+
             // VAAPI: open a hwdevice on the default render node, hand a
             // bumped reference to the codec context, and pin the
             // negotiated pixel format to AV_PIX_FMT_VAAPI via the
@@ -947,6 +1105,17 @@ impl VideoDecoder {
     /// name.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// The decoder's current reorder depth — libavcodec's
+    /// `AVCodecContext.has_b_frames`: how many decoded frames it holds back
+    /// to emit pictures in display order, and so the decoder's steady-state
+    /// latency in frames beyond decode itself. Starts at the
+    /// [`ReorderSeed`] (0 without one) and only ever grows as libavcodec
+    /// learns a stream's depth; [`Self::flush`] does not reset it.
+    /// Diagnostic.
+    pub fn reorder_depth(&self) -> u32 {
+        unsafe { (*self.ctx).has_b_frames.max(0) as u32 }
     }
 
     /// libavcodec's `AVCodecContext.active_thread_type` after open: 0 single
@@ -1103,7 +1272,17 @@ impl VideoDecoder {
         self.last_transfer_us
     }
 
-    /// Reset the decoder state. Use after seeking or stream discontinuity.
+    /// Reset the decoder state. Use after seeking or a discontinuity in the
+    /// **same** source.
+    ///
+    /// It does not reset the reorder depth libavcodec has learned
+    /// ([`Self::reorder_depth`]) and cannot re-apply a [`ReorderSeed`]:
+    /// libavcodec's flush keeps `has_b_frames`, and frame-thread workers
+    /// never re-read it. After a switch to a different source, drop the
+    /// decoder and reopen it with [`Self::open_opts`] on the new source's
+    /// first access unit; otherwise a switch from a shallow (IPPP) source to
+    /// a deep one can show a GOP of garbage, and a switch the other way
+    /// keeps the old, deeper latency for good.
     pub fn flush(&mut self) {
         unsafe {
             avcodec_flush_buffers(self.ctx);
@@ -1360,6 +1539,125 @@ mod tests {
             let single = VideoDecoder::open(codec).unwrap();
             assert_eq!(single.active_thread_type(), 0, "{codec}");
         }
+    }
+
+    fn au_with_sps(sps_hex: &str) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1];
+        au.extend(
+            (0..sps_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&sps_hex[i..i + 2], 16).unwrap()),
+        );
+        au
+    }
+
+    #[test]
+    fn existing_constructors_leave_reorder_unseeded() {
+        // Keep-behaviour guarantee: open / open_threaded / open_with_backend
+        // start at libavcodec's has_b_frames = 0, exactly as before.
+        init();
+        assert_eq!(VideoDecoder::open(VideoCodec::H264).unwrap().reorder_depth(), 0);
+        assert_eq!(VideoDecoder::open_threaded(VideoCodec::H264).unwrap().reorder_depth(), 0);
+        assert_eq!(
+            VideoDecoder::open_with_backend(VideoCodec::H264, DecoderBackend::Cpu)
+                .unwrap()
+                .reorder_depth(),
+            0
+        );
+    }
+
+    #[test]
+    fn reorder_seed_follows_the_access_unit() {
+        use crate::h264_sps::tests::{NINE, SKY_SPORTS};
+        init();
+        let open = |seed: ReorderSeed<'_>, threading| {
+            VideoDecoder::open_opts(
+                VideoCodec::H264,
+                DecoderOptions {
+                    threading,
+                    reorder_seed: seed,
+                    ..DecoderOptions::default()
+                },
+            )
+            .unwrap()
+            .reorder_depth()
+        };
+        for threading in [DecoderThreading::Single, DecoderThreading::Auto] {
+            // Nine declares its depth (3): libavcodec applies it before any
+            // gap handling, so the seed stays 0 and adds no latency.
+            let nine = au_with_sps(NINE);
+            assert_eq!(open(ReorderSeed::FromAccessUnit(&nine), threading), 0);
+            // Sky Sports declares nothing: seed 1, which stops the
+            // unmarked-random-access heuristic marking the join's gap
+            // placeholders as recovered.
+            let sky = au_with_sps(SKY_SPORTS);
+            assert_eq!(open(ReorderSeed::FromAccessUnit(&sky), threading), 1);
+            // No SPS in hand (open triggered on a non-keyframe) → 1.
+            assert_eq!(open(ReorderSeed::FromAccessUnit(&[]), threading), 1);
+            assert_eq!(open(ReorderSeed::Frames(3), threading), 3);
+            assert_eq!(open(ReorderSeed::LibavcodecDefault, threading), 0);
+        }
+    }
+
+    #[test]
+    fn reorder_seed_applies_to_h264_only() {
+        // HEVC signals its reorder depth mandatorily and MPEG-2 has
+        // low_delay; a seed there would only add latency.
+        init();
+        for codec in [VideoCodec::Hevc, VideoCodec::Mpeg2] {
+            let dec = VideoDecoder::open_opts(
+                codec,
+                DecoderOptions {
+                    reorder_seed: ReorderSeed::Frames(2),
+                    ..DecoderOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(dec.reorder_depth(), 0, "{codec}");
+        }
+    }
+
+    #[test]
+    fn seeded_decoder_holds_one_frame_until_flushed() {
+        // What the seed costs, observable: an undeclared stream's first
+        // picture is held until the next one (or a flush) arrives, so a
+        // one-shot caller must `send_flush()` — `send_packet(&[])` is not an
+        // EOS, it is rejected as EmptyInput.
+        init();
+        let idr = tiny_idr();
+        let mut seeded = VideoDecoder::open_opts(
+            VideoCodec::H264,
+            DecoderOptions {
+                reorder_seed: ReorderSeed::Frames(1),
+                ..DecoderOptions::default()
+            },
+        )
+        .unwrap();
+        seeded.send_packet(&idr).unwrap();
+        assert!(matches!(seeded.receive_frame(), Err(VideoError::NeedMoreInput)));
+        assert!(matches!(seeded.send_packet(&[]), Err(VideoError::EmptyInput)));
+        seeded.send_flush().unwrap();
+        assert!(seeded.receive_frame().is_ok(), "flush releases the held picture");
+
+        let mut unseeded = VideoDecoder::open(VideoCodec::H264).unwrap();
+        unseeded.send_packet(&idr).unwrap();
+        assert!(unseeded.receive_frame().is_ok(), "seed 0 emits at once");
+    }
+
+    /// A real one-frame 16x16 grey H.264 IDR access unit — SPS + PPS + IDR
+    /// slice from libx264 (`-profile:v baseline -tune zerolatency`), its
+    /// x264 version SEI dropped. Literal, so the default-feature build (no
+    /// encoder) tests with it too.
+    fn tiny_idr() -> Vec<u8> {
+        const IDR: &str = concat!(
+            "000000016742c00ad91ec044000003000400000300ca3c489920",
+            "0000000168cb83cb20",
+            "0000000165888404bc98a000202f80",
+        );
+        (0..IDR.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&IDR[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
