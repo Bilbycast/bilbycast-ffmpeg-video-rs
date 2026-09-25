@@ -147,6 +147,13 @@ fn reduce_sar(num: u32, den: u32) -> Result<(u32, u32), VideoEncoderError> {
     Ok((n, d))
 }
 
+/// Whether `codec`'s libavcodec wrapper re-signals a sample aspect ratio
+/// changed after open ([`VideoEncoder::set_sample_aspect_ratio`]): libx264
+/// only.
+fn follows_sample_aspect_ratio(codec: VideoEncoderCodec) -> bool {
+    matches!(codec, VideoEncoderCodec::X264)
+}
+
 /// Mark `frame` as progressive, or as interlaced in `order`: the
 /// `AV_FRAME_FLAG_INTERLACED` / `AV_FRAME_FLAG_TOP_FIELD_FIRST` bits libx264
 /// (`b_tff`, re-read per frame), h264_nvenc (`pictureStruct`) and h264_qsv
@@ -1151,6 +1158,55 @@ impl VideoEncoder {
     /// unspecified.
     pub fn sample_aspect_ratio(&self) -> Option<(u32, u32)> {
         self.sample_aspect_ratio
+    }
+
+    /// Change the sample aspect ratio signalled from the next frame on — for
+    /// a source whose aspect changes mid-stream (an SD service switching
+    /// between 16:9 and 4:3 programmes) or a switch to a source of another
+    /// shape, without reopening.
+    ///
+    /// Only libx264 follows it: its wrapper compares
+    /// `AVCodecContext.sample_aspect_ratio` with the VUI on every frame and
+    /// reconfigures x264 (`reconfig_encoder` in `libx264.c`), whose next SPS
+    /// carries the new ratio. An IDR is forced here so that SPS goes out at
+    /// once, when the encoder repeats its headers in-band (`global_header =
+    /// false`; with out-of-band headers the receiver never sees it). Every
+    /// other backend reads the ratio only at open — libx265, qsvenc, the
+    /// VAAPI and RKMPP header writers — and returns `Ok(false)` with nothing
+    /// changed; so does NVENC, whose wrapper does reconfigure its display
+    /// aspect per frame but has not been verified to re-signal it — and so
+    /// does libx264 for `None` once it signals a ratio, which it cannot
+    /// withdraw (ask for 1:1, which a receiver reads the same way). With a
+    /// `tune` other than `zerolatency`, a keyframe still in x264's lookahead
+    /// when the ratio changes is written with the new one. `Ok(true)` when
+    /// the encoder now signals `sar` (including when it already did).
+    pub fn set_sample_aspect_ratio(
+        &mut self,
+        sar: Option<(u32, u32)>,
+    ) -> Result<bool, VideoEncoderError> {
+        let sar = sar.map(|(n, d)| reduce_sar(n, d)).transpose()?;
+        if sar == self.sample_aspect_ratio {
+            return Ok(true);
+        }
+        // libx264 cannot withdraw a ratio once it has signalled one: the
+        // unspecified 0/1 never reaches its SPS again.
+        if !follows_sample_aspect_ratio(self.codec)
+            || (sar.is_none() && self.sample_aspect_ratio.is_some())
+        {
+            return Ok(false);
+        }
+        let (num, den) = sar.unwrap_or((0, 1));
+        // SAFETY: `ctx` is the open codec context this encoder owns; the
+        // wrapper reads the field on the next `avcodec_send_frame`.
+        unsafe {
+            (*self.ctx).sample_aspect_ratio = AVRational {
+                num: num as i32,
+                den: den as i32,
+            };
+        }
+        self.sample_aspect_ratio = sar;
+        self.force_idr_next = true;
+        Ok(true)
     }
 
     /// Chroma subsampling the encoder was opened with.
@@ -2390,6 +2446,79 @@ mod tests {
         let mut prog = VideoEncoder::open(&interlace_cfg(None)).unwrap();
         assert!(prog.set_frame_field_order(VideoFieldOrder::Tff).is_err());
         assert_eq!(prog.field_order(), None);
+    }
+
+    /// An SD service switching from a 16:9 programme (64:45) to a 4:3 one
+    /// (16:15), then to square pixels (1:1): libx264 re-signals each from
+    /// the frame of the change — a forced IDR carries the new SPS
+    /// at once (the GOP here is far longer than the clip) — and the frames
+    /// before it keep the old ratio.
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_sample_aspect_ratio_follows_the_source_mid_stream() {
+        let cfg = VideoEncoderConfig {
+            sample_aspect_ratio: Some((64, 45)),
+            gop_size: 250,
+            ..interlace_cfg(None)
+        };
+        let mut enc = VideoEncoder::open(&cfg).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let u = vec![128u8; (w / 2) * (h / 2)];
+        let mut packets = Vec::new();
+        for i in 0..18 {
+            if i == 6 {
+                // Reduced on the way in, like the open-time ratio.
+                assert!(enc.set_sample_aspect_ratio(Some((32, 30))).unwrap());
+                assert_eq!(enc.sample_aspect_ratio(), Some((16, 15)));
+            }
+            if i == 12 {
+                // A ratio once signalled cannot be withdrawn; 1:1 can.
+                assert!(!enc.set_sample_aspect_ratio(None).unwrap());
+                assert_eq!(enc.sample_aspect_ratio(), Some((16, 15)));
+                assert!(enc.set_sample_aspect_ratio(Some((1, 1))).unwrap());
+            }
+            // Asking for what it already signals changes nothing.
+            assert!(enc.set_sample_aspect_ratio(enc.sample_aspect_ratio()).unwrap());
+            let y: Vec<u8> = (0..w * h).map(|p| ((p + i * 13) % 200 + 16) as u8).collect();
+            packets.extend(enc.encode_frame(&y, w, &u, w / 2, &u, w / 2, None).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        let sps: Vec<_> = packets
+            .iter()
+            .filter_map(|p| crate::h264_sps::find_h264_sps(&p.data))
+            .map(|s| s.sample_aspect_ratio.map(|(n, d)| (n as u32, d as u32)))
+            .collect();
+        assert_eq!(sps, [Some((64, 45)), Some((16, 15)), Some((1, 1))], "one SPS per IDR, forced");
+        let sar: Vec<_> = decoded_field_flags(&packets).iter().map(|f| f.2).collect();
+        let want: Vec<_> = (0..18)
+            .map(|i| match i {
+                0..6 => Some((64, 45)),
+                6..12 => Some((16, 15)),
+                _ => Some((1, 1)),
+            })
+            .collect();
+        assert_eq!(sar, want);
+        assert!(enc.set_sample_aspect_ratio(Some((0, 1))).is_err(), "a zero term is refused");
+    }
+
+    /// Only libx264 re-signals a ratio changed after open; every other
+    /// backend fixes it there, and says so rather than pretending.
+    #[test]
+    fn only_libx264_follows_a_sample_aspect_ratio_change() {
+        for codec in [
+            VideoEncoderCodec::X265,
+            VideoEncoderCodec::H264Nvenc,
+            VideoEncoderCodec::HevcNvenc,
+            VideoEncoderCodec::H264Qsv,
+            VideoEncoderCodec::HevcQsv,
+            VideoEncoderCodec::H264Vaapi,
+            VideoEncoderCodec::HevcVaapi,
+            VideoEncoderCodec::H264Rkmpp,
+            VideoEncoderCodec::HevcRkmpp,
+        ] {
+            assert!(!follows_sample_aspect_ratio(codec), "{codec:?}");
+        }
+        assert!(follows_sample_aspect_ratio(VideoEncoderCodec::X264));
     }
 
     #[cfg(feature = "video-encoder-x264")]

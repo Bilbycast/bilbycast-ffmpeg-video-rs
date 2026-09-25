@@ -288,7 +288,14 @@ Option<(u32, u32)>`, `None` = libavcodec's unspecified `0/1`, the default):
 reduced, both terms non-zero and ≤ 65535, written to
 `AVCodecContext.sample_aspect_ratio`, which libx264 / libx265 / nvenc / qsvenc
 and the VAAPI header writers put in the VUI. Anamorphic SD (720x576 16:9 =
-64:45) displays squeezed without it.
+64:45) displays squeezed without it. `set_sample_aspect_ratio()` changes it
+after open — for an SD service that switches between 16:9 and 4:3
+programmes, or a switch to a source of another shape — and forces an IDR so
+the new SPS goes out at once. Only libx264 re-signals it (its wrapper
+reconfigures x264 per frame); every other backend fixes the ratio at open
+and returns `Ok(false)`, NVENC included (its wrapper reconfigures the display
+aspect, unverified), and libx264 cannot withdraw a ratio back to
+unspecified (ask for 1:1).
 
 **Production controls** (`VideoEncoderConfig`): rate-control mode
 (VBR / CBR / CRF / ABR), CRF target, GOP size, B-frames, refs, preset,
