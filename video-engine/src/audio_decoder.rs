@@ -80,6 +80,25 @@ impl AudioDecoder {
     /// info inline in every frame, and Opus inside MPEG-TS rides with a
     /// registration descriptor that the demuxer ingests separately.
     pub fn open(codec: AudioDecoderCodec) -> Result<Self, AudioError> {
+        Self::open_with_options(codec, &[])
+    }
+
+    /// [`Self::open`], with the decoder's private AVOptions set before it
+    /// opens — `(name, value)` pairs as FFmpeg's `-name value` would take
+    /// them. The broadcast case is AC-3 / E-AC-3: `drc_scale` (default 1:
+    /// the bitstream's line-mode dynamic-range compression is applied to
+    /// the output, so a re-encode carries the compressed programme and a
+    /// receiver can no longer choose) and `cons_noisegen` (default 0: the
+    /// dither that fills zero-bit mantissas comes from one generator run
+    /// across frames, so two decodes of the same frame differ; 1 seeds it
+    /// from each frame, making the decode a function of the frame's bytes).
+    ///
+    /// An option the decoder does not have, or a value it refuses, is an
+    /// error ([`AudioError::InvalidInput`]) — never silently ignored.
+    pub fn open_with_options(
+        codec: AudioDecoderCodec,
+        options: &[(&str, &str)],
+    ) -> Result<Self, AudioError> {
         unsafe {
             let codec_ptr = match codec {
                 AudioDecoderCodec::Mp2 => avcodec_find_decoder(AVCodecID_AV_CODEC_ID_MP2),
@@ -106,6 +125,10 @@ impl AudioDecoder {
             let ctx = avcodec_alloc_context3(codec_ptr);
             if ctx.is_null() {
                 return Err(AudioError::AllocContext);
+            }
+            if let Err(e) = set_private_options(ctx, options) {
+                avcodec_free_context(&mut { ctx });
+                return Err(e);
             }
 
             let ret = avcodec_open2(ctx, codec_ptr, std::ptr::null_mut());
@@ -337,6 +360,37 @@ impl Drop for AudioDecoder {
     }
 }
 
+/// Set codec-private AVOptions (`AVCodecContext::priv_data`) by name, from
+/// strings, the way FFmpeg's command line does: on a context allocated for
+/// its codec and not yet opened, or on an open one for the options a codec
+/// reads per frame (AC-3's `dialnorm` under `per_frame_metadata`).
+pub(crate) unsafe fn set_private_options(
+    ctx: *mut AVCodecContext,
+    options: &[(&str, &str)],
+) -> Result<(), AudioError> {
+    for &(name, value) in options {
+        let obj = (*ctx).priv_data;
+        if obj.is_null() {
+            return Err(AudioError::InvalidInput(format!(
+                "option {name}={value}: the codec has no private options"
+            )));
+        }
+        let (Ok(key), Ok(val)) = (std::ffi::CString::new(name), std::ffi::CString::new(value))
+        else {
+            return Err(AudioError::InvalidInput(format!(
+                "option {name}={value}: contains a NUL byte"
+            )));
+        };
+        let ret = av_opt_set(obj, key.as_ptr(), val.as_ptr(), 0);
+        if ret < 0 {
+            return Err(AudioError::InvalidInput(format!(
+                "option {name}={value}: refused by the codec (FFmpeg error {ret})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // FFmpeg's AVERROR macros are C macros that bindgen doesn't lift cleanly
 // across all toolchains. The two we need are EAGAIN and EOF; their
 // values are stable in practice (`AVERROR(EAGAIN)` == -11 on Linux/macOS,
@@ -361,4 +415,85 @@ const fn libc_eagain() -> u32 {
     // build. Windows uses a different value but we don't target it for
     // the display output.
     11
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_encoder::AudioEncoder;
+    use video_codec::{AudioCodecType, AudioEncoderConfig};
+
+    /// AC-3 frames of low-level noise at a bitrate low enough that the
+    /// encoder leaves mantissas at zero bits, which the decoder fills with
+    /// dither.
+    fn ac3_noise_frames(n: usize) -> Vec<Vec<u8>> {
+        let mut enc = AudioEncoder::open(&AudioEncoderConfig {
+            codec: AudioCodecType::Ac3,
+            sample_rate: 48000,
+            channels: 2,
+            bitrate_kbps: 64,
+        })
+        .unwrap();
+        let mut seed = 0x1234_5678u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32 - 0.5) * 0.05
+        };
+        let mut out = Vec::new();
+        while out.len() < n {
+            let planar: Vec<Vec<f32>> = (0..2).map(|_| (0..1536).map(|_| noise()).collect()).collect();
+            out.extend(enc.encode_frame(&planar).unwrap().into_iter().map(|f| f.data.to_vec()));
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// Decode `frames` with a fresh decoder and return the last frame's PCM.
+    fn last_frame(frames: &[Vec<u8>], options: &[(&str, &str)]) -> Vec<f32> {
+        let mut dec = AudioDecoder::open_with_options(AudioDecoderCodec::Ac3, options).unwrap();
+        let mut last = Vec::new();
+        for f in frames {
+            dec.send_packet(f, 0).unwrap();
+            while let Ok(out) = dec.receive_frame() {
+                last = out.planar[0].clone();
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn consistent_noise_makes_a_frame_decode_the_same_whatever_came_before() {
+        crate::silence_ffmpeg_logs();
+        let frames = ac3_noise_frames(6);
+        // The same last two frames, reached from a different history: the
+        // dither generator has run over a different number of frames.
+        let (long, short) = (&frames[..], &frames[3..]);
+        let a = last_frame(long, &[]);
+        let b = last_frame(short, &[]);
+        assert_eq!(a.len(), 1536);
+        assert_ne!(a, b, "the default dither differs between the two decodes");
+        let a = last_frame(long, &[("cons_noisegen", "1")]);
+        let b = last_frame(short, &[("cons_noisegen", "1")]);
+        assert_eq!(a, b, "seeded from each frame, the dither is a function of its bytes");
+    }
+
+    #[test]
+    fn drc_scale_is_accepted_and_unknown_options_are_errors() {
+        crate::silence_ffmpeg_logs();
+        for codec in [AudioDecoderCodec::Ac3, AudioDecoderCodec::Eac3] {
+            assert!(AudioDecoder::open_with_options(codec, &[("drc_scale", "0"), ("cons_noisegen", "1")]).is_ok());
+            assert!(matches!(
+                AudioDecoder::open_with_options(codec, &[("drc_scale", "9")]),
+                Err(AudioError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            AudioDecoder::open_with_options(AudioDecoderCodec::Ac3, &[("no_such_option", "1")]),
+            Err(AudioError::InvalidInput(_))
+        ));
+        // No options: exactly `open`.
+        assert!(AudioDecoder::open_with_options(AudioDecoderCodec::Mp2, &[]).is_ok());
+    }
 }

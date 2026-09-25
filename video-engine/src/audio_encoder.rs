@@ -63,6 +63,24 @@ unsafe impl Send for AudioEncoder {}
 impl AudioEncoder {
     /// Open an audio encoder for the specified codec.
     pub fn open(config: &AudioEncoderConfig) -> Result<Self, AudioError> {
+        Self::open_with_options(config, &[])
+    }
+
+    /// [`Self::open`], with the encoder's private AVOptions set before it
+    /// opens — `(name, value)` pairs as FFmpeg's `-name value` would take
+    /// them. The broadcast case is AC-3 metadata: `dialnorm` (-31..-1,
+    /// default -31) is the dialogue level a receiver normalises to, so a
+    /// transcode of a -24 dB programme that writes the default plays 7 dB
+    /// louder than its source on a receiver that honours it; with
+    /// `per_frame_metadata` = 1 it can then follow the source frame by
+    /// frame through [`Self::set_option`].
+    ///
+    /// An option the encoder does not have, or a value it refuses, is an
+    /// error ([`AudioError::InvalidInput`]) — never silently ignored.
+    pub fn open_with_options(
+        config: &AudioEncoderConfig,
+        options: &[(&str, &str)],
+    ) -> Result<Self, AudioError> {
         unsafe {
             // Find the encoder
             let codec_ptr = match config.codec {
@@ -111,6 +129,11 @@ impl AudioEncoder {
 
             // Allow experimental codecs
             (*ctx).strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+
+            if let Err(e) = crate::audio_decoder::set_private_options(ctx, options) {
+                avcodec_free_context(&mut { ctx });
+                return Err(e);
+            }
 
             let ret = avcodec_open2(ctx, codec_ptr, std::ptr::null_mut());
             if ret < 0 {
@@ -200,6 +223,16 @@ impl AudioEncoder {
     /// presents that much late against the video it was captured with.
     pub fn initial_padding(&self) -> usize {
         self.initial_padding
+    }
+
+    /// Change a private AVOption of the open encoder; it applies from the
+    /// next frame the codec reads it on. For AC-3 that is the bitstream
+    /// metadata (`dialnorm`, `dsur_mode`, the mix levels), and only when
+    /// the encoder was opened with `per_frame_metadata` = 1 — without it
+    /// the AC-3 encoder validated its metadata once, at open, and a change
+    /// here would not reach the bitstream consistently.
+    pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), AudioError> {
+        unsafe { crate::audio_decoder::set_private_options(self.ctx, &[(name, value)]) }
     }
 
     /// Encode one frame of planar f32 PCM audio.
@@ -599,6 +632,87 @@ mod tests {
                 "{codec}: round-trip lag {lag} samples vs initial_padding {pad}"
             );
         }
+    }
+
+    /// `dialnorm` of an AC-3 syncframe (ATSC A/52 §5.3.2): the 5-bit field
+    /// after `lfeon`, 0 read as -31.
+    fn ac3_dialnorm(frame: &[u8]) -> i32 {
+        let bit = |i: usize| ((frame[i / 8] >> (7 - i % 8)) & 1) as u32;
+        let bits = |at: usize, n: usize| (0..n).fold(0u32, |v, k| (v << 1) | bit(at + k));
+        // syncword 16, crc1 16, fscod 2, frmsizecod 6, bsid 5, bsmod 3.
+        let acmod = bits(48, 3);
+        let mut at = 51;
+        if acmod & 1 != 0 && acmod != 1 {
+            at += 2;
+        }
+        if acmod & 4 != 0 {
+            at += 2;
+        }
+        if acmod == 2 {
+            at += 2;
+        }
+        at += 1; // lfeon
+        match bits(at, 5) {
+            0 => -31,
+            d => -(d as i32),
+        }
+    }
+
+    #[test]
+    fn ac3_dialnorm_is_set_at_open_and_follows_set_option() {
+        init();
+        let cfg = AudioEncoderConfig {
+            codec: AudioCodecType::Ac3,
+            sample_rate: 48000,
+            channels: 2,
+            bitrate_kbps: 192,
+        };
+        let silence = vec![vec![0.0f32; 1536]; 2];
+        let encode = |enc: &mut AudioEncoder| -> Vec<i32> {
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.extend(enc.encode_frame(&silence).unwrap().iter().map(|f| ac3_dialnorm(&f.data)));
+            }
+            out
+        };
+        // The default the edge used to write whatever the source said.
+        let mut plain = AudioEncoder::open(&cfg).unwrap();
+        assert!(encode(&mut plain).iter().all(|&d| d == -31));
+
+        let mut enc = AudioEncoder::open_with_options(
+            &cfg,
+            &[("dialnorm", "-24"), ("per_frame_metadata", "1")],
+        )
+        .unwrap();
+        let first = encode(&mut enc);
+        assert!(!first.is_empty() && first.iter().all(|&d| d == -24), "{first:?}");
+        enc.set_option("dialnorm", "-27").unwrap();
+        let later = encode(&mut enc);
+        assert!(!later.is_empty() && later.iter().all(|&d| d == -27), "{later:?}");
+        // Out of the codec's range: refused, and the stream keeps its value.
+        assert!(enc.set_option("dialnorm", "-40").is_err());
+        assert!(encode(&mut enc).iter().all(|&d| d == -27));
+    }
+
+    #[test]
+    fn unknown_or_refused_options_are_errors() {
+        init();
+        let cfg = AudioEncoderConfig {
+            codec: AudioCodecType::Ac3,
+            sample_rate: 48000,
+            channels: 2,
+            bitrate_kbps: 192,
+        };
+        assert!(matches!(
+            AudioEncoder::open_with_options(&cfg, &[("no_such_option", "1")]),
+            Err(AudioError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            AudioEncoder::open_with_options(&cfg, &[("dialnorm", "0")]),
+            Err(AudioError::InvalidInput(_))
+        ));
+        let mut enc = AudioEncoder::open(&cfg).unwrap();
+        assert!(enc.set_option("no_such_option", "1").is_err());
     }
 
     #[test]
