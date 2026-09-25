@@ -170,7 +170,10 @@ cargo build -p video-engine --features video-encoder-rkmpp,video-decoder-rkmpp
 - `send_packet(data)` / `send_packet_with_pts(data, pts)` — feed Annex B NAL
   unit data (or MPEG-2 elementary stream verbatim); the PTS variant rides the
   stamp through libavcodec's reorder queue
-- `receive_frame()` → `DecodedFrame` with Y-plane access for luminance
+- `receive_frame()` → `DecodedFrame` with Y-plane access for luminance,
+  `is_interlaced()` / `top_field_first()`, and `sample_aspect_ratio()`
+  (`None` when unspecified). `VideoDecoder::sample_aspect_ratio()` is the
+  context-level fallback
 - `send_flush()` — signal end-of-stream so `receive_frame()` drains
 - `flush()` — reset decoder state
 
@@ -180,7 +183,8 @@ exports a `DrmPrimeFrame` DMA-BUF descriptor (what bilbycast-edge's
 `engine::output_display` repacks into a `display::kms::DrmPrimeDescriptor` for
 the `drm` crate's `add_planar_framebuffer` — zero-copy KMS scanout),
 and `download_to_sysmem()` copies it back to a plain planar frame when a CPU
-consumer needs one.
+consumer needs one (carrying pts, colorimetry, the key / interlace flags and
+the sample aspect ratio across).
 
 ### H.264 SPS parser (`video-engine/src/h264_sps.rs`)
 
@@ -259,6 +263,33 @@ H.264 / HEVC compression:
 - `flush()` — drain trailing frames at end-of-stream.
 - `extradata()` — out-of-band SPS/PPS when `global_header = true`.
 
+**Interlace** (`VideoEncoderConfig::field_order: Option<VideoFieldOrder>`,
+`None` = progressive, the default and historical behaviour): `Some(Tff | Bff)`
+sets `AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME` and
+`field_order` before open and stamps `AV_FRAME_FLAG_INTERLACED` (+
+`TOP_FIELD_FIRST`) on every submitted frame. libx264 codes **MBAFF** from the
+flag alone — it turns on `pic_struct` in the picture-timing SEI by itself and
+follows the per-frame `TOP_FIELD_FIRST` for `b_tff` by reconfiguring, so no
+`x264-params` are added (measured: removing the flag, not any parameter, is
+what turns the output progressive); `h264_nvenc` uses field mode, `h264_qsv`
+`MFX_PICSTRUCT_FIELD_*`. `VideoEncoderCodec::supports_field_coding()`
+is the static answer (those three); every other backend is refused at the
+top of `open()` with `VideoEncoderError::FieldCodingUnsupported(codec)` so a
+resolver chain falls through. The hardware two still decide at open —
+`probe_open_encoder_field_coding(name)` asks the host (on ms02's Intel Arrow
+Lake iGPU `h264_qsv` refuses with "Current picture structure is unsupported",
+`ENOSYS`). The frame height must split into whole chroma fields (÷4 for 4:2:0,
+÷2 otherwise). `set_frame_field_order()` follows a TFF↔BFF source change
+without reopening; progressive vs interlaced is fixed at open. Feed woven
+frames at the frame rate, and never scale a woven frame vertically.
+
+**Sample aspect ratio** (`VideoEncoderConfig::sample_aspect_ratio:
+Option<(u32, u32)>`, `None` = libavcodec's unspecified `0/1`, the default):
+reduced, both terms non-zero and ≤ 65535, written to
+`AVCodecContext.sample_aspect_ratio`, which libx264 / libx265 / nvenc / qsvenc
+and the VAAPI header writers put in the VUI. Anamorphic SD (720x576 16:9 =
+64:45) displays squeezed without it.
+
 **Production controls** (`VideoEncoderConfig`): rate-control mode
 (VBR / CBR / CRF / ABR), CRF target, GOP size, B-frames, refs, preset,
 profile (auto / baseline / main / high / high10 / high422 / high444 / main10),
@@ -291,7 +322,7 @@ copies each frame into an MPP/DRM buffer internally.
 ### Hardware probe (`video-engine/src/probe.rs`)
 
 The public module behind bilbycast-edge's `engine::hardware_probe` and the
-`resource_budget` block it advertises on the health tick. Three tiers, all
+`resource_budget` block it advertises on the health tick. Four tiers, all
 re-exported from the crate root:
 
 - **Availability** — `is_encoder_available(name)` / `is_decoder_available(name)`.
@@ -313,6 +344,9 @@ re-exported from the crate root:
   tiers of geometry ship as constants: `PROBE_WIDTH/HEIGHT_1080P` and
   `PROBE_WIDTH/HEIGHT_4K` — capacity at 4K is materially lower and is reported
   separately.
+- **Field coding** — `probe_open_encoder_field_coding(name)` opens `name`
+  interlaced (`field_order = Tff`) through `VideoEncoder::open`; `NotCompiled`
+  for a backend without field coding or not built.
 
 `ProbeChroma` is the chroma + bit-depth axis (`Yuv420_8bit`, `Yuv422_8bit`,
 `Yuv420_10bit`, `Yuv422_10bit`) and `ProbeError` the result type.

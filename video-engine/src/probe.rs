@@ -339,6 +339,63 @@ pub fn probe_open_vaapi_encoder_chroma(
     Err(ProbeError::NotCompiled)
 }
 
+/// Can `name` open an **interlaced** (field-coded) session on this host?
+///
+/// [`video_codec::VideoEncoderCodec::supports_field_coding`] answers for the
+/// wrapper; this answers for the host, because the two capable hardware
+/// backends decide at open time: `h264_nvenc` refuses with `ENOSYS` when the
+/// GPU does not report `NV_ENC_CAPS_SUPPORT_FIELD_ENCODING`, and `h264_qsv`
+/// when the platform's encoder cannot initialise `MFX_PICSTRUCT_FIELD_TFF`.
+/// libx264 always can. Routes through `VideoEncoder::open` with
+/// `field_order = Tff` at [`PROBE_WIDTH`] x [`PROBE_HEIGHT`], so it exercises
+/// exactly the open path a real interlaced encode takes.
+///
+/// Returns [`ProbeError::NotCompiled`] for a name that is not a known
+/// backend, a backend without field coding (libx265, the HEVC and VAAPI /
+/// RKMPP encoders), or one whose Cargo feature is off — "not in the matrix"
+/// and "not built" fold into one bit, as with
+/// [`probe_open_encoder_chroma`].
+pub fn probe_open_encoder_field_coding(name: &str) -> Result<(), ProbeError> {
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoEncoderError, VideoFieldOrder};
+
+    let Some(codec) = VideoEncoderCodec::from_ffmpeg_name(name) else {
+        return Err(ProbeError::NotCompiled);
+    };
+    if !codec.supports_field_coding() {
+        return Err(ProbeError::NotCompiled);
+    }
+    let cfg = VideoEncoderConfig {
+        codec,
+        width: PROBE_WIDTH as u32,
+        height: PROBE_HEIGHT as u32,
+        fps_num: PROBE_FPS_NUM as u32,
+        fps_den: 1,
+        time_base_num: 0,
+        time_base_den: 0,
+        bitrate_kbps: (PROBE_BITRATE / 1000) as u32,
+        gop_size: PROBE_GOP as u32,
+        max_b_frames: 0,
+        // No `tune`: the default `zerolatency` is an x264 spelling that
+        // NVENC's own `tune` option rejects with EINVAL, which would read as
+        // "no field coding" when it is nothing of the kind.
+        tune: String::new(),
+        field_order: Some(VideoFieldOrder::Tff),
+        ..VideoEncoderConfig::default()
+    };
+    match crate::video_encoder::VideoEncoder::open(&cfg) {
+        Ok(_enc) => Ok(()),
+        Err(
+            VideoEncoderError::EncoderDisabled(_)
+            | VideoEncoderError::EncoderNotFound(_)
+            | VideoEncoderError::FieldCodingUnsupported(_),
+        ) => Err(ProbeError::NotCompiled),
+        Err(VideoEncoderError::OpenCodec(code))
+        | Err(VideoEncoderError::AllocFrameBuffer(code))
+        | Err(VideoEncoderError::SendFrame(code)) => Err(ProbeError::from_avcodec_ret(code)),
+        Err(_) => Err(ProbeError::OpenFailed(-22)),
+    }
+}
+
 /// VAAPI-aware encoder session-count probe. Counts the maximum number
 /// of concurrent `VideoEncoder::open()` calls that succeed, capped at
 /// `upper_bound`. AMD VCN (radeonsi) typically caps at 1–2 concurrent

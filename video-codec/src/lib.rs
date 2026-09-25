@@ -344,6 +344,52 @@ impl VideoEncoderCodec {
         }
     }
 
+    /// The backend whose [`Self::ffmpeg_name`] is `name`, or `None` for a
+    /// name this enum does not carry. The inverse of `ffmpeg_name`, for
+    /// callers (the host probes) that are handed FFmpeg's spelling.
+    pub fn from_ffmpeg_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "libx264" => VideoEncoderCodec::X264,
+            "libx265" => VideoEncoderCodec::X265,
+            "h264_nvenc" => VideoEncoderCodec::H264Nvenc,
+            "hevc_nvenc" => VideoEncoderCodec::HevcNvenc,
+            "h264_qsv" => VideoEncoderCodec::H264Qsv,
+            "hevc_qsv" => VideoEncoderCodec::HevcQsv,
+            "h264_vaapi" => VideoEncoderCodec::H264Vaapi,
+            "hevc_vaapi" => VideoEncoderCodec::HevcVaapi,
+            "h264_rkmpp" => VideoEncoderCodec::H264Rkmpp,
+            "hevc_rkmpp" => VideoEncoderCodec::HevcRkmpp,
+            _ => return None,
+        })
+    }
+
+    /// Whether this backend can code an interlaced picture as fields
+    /// (`VideoEncoderConfig::field_order`). A build-time property of the
+    /// FFmpeg wrapper, not of the host:
+    ///
+    /// - `X264`: MBAFF (`AV_CODEC_FLAG_INTERLACED_DCT` → `b_interlaced`).
+    /// - `H264Nvenc`: field mode (`NV_ENC_PARAMS_FRAME_FIELD_MODE_FIELD`).
+    ///   The GPU still has to advertise `NV_ENC_CAPS_SUPPORT_FIELD_ENCODING`;
+    ///   one that does not refuses the open with `ENOSYS`, so a caller that
+    ///   must know before the first frame asks
+    ///   `video_engine::probe_open_encoder_field_coding`.
+    /// - `H264Qsv`: `MFX_PICSTRUCT_FIELD_TFF/BFF`. Platform dependent in the
+    ///   same way.
+    ///
+    /// Every other backend returns `false` and `VideoEncoder::open` refuses
+    /// a field order on it with
+    /// [`VideoEncoderError::FieldCodingUnsupported`] — libx265 and the HEVC
+    /// hardware encoders have no interlaced tool in FFmpeg's wrappers (HEVC
+    /// carries interlace as field pictures plus SEI, which none of them
+    /// produce), `h264_vaapi` and `h264_rkmpp` ignore the flag and would code
+    /// progressive frames while the caller believed otherwise.
+    pub fn supports_field_coding(self) -> bool {
+        matches!(
+            self,
+            VideoEncoderCodec::X264 | VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::H264Qsv
+        )
+    }
+
     /// FFmpeg encoder name passed to `avcodec_find_encoder_by_name`.
     pub fn ffmpeg_name(self) -> &'static str {
         match self {
@@ -514,6 +560,38 @@ impl VideoRateControl {
     }
 }
 
+/// Field order of an interlaced encode. Set on
+/// [`VideoEncoderConfig::field_order`]; `None` there means progressive, the
+/// historical behaviour.
+///
+/// "Top field first" is the temporal order of the two fields woven into one
+/// frame (`AV_FRAME_FLAG_TOP_FIELD_FIRST` on a decoded frame; 1080i50 is
+/// almost always TFF, NTSC-derived SD commonly BFF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoFieldOrder {
+    /// Top field first (`AV_FIELD_TT`).
+    Tff,
+    /// Bottom field first (`AV_FIELD_BB`).
+    Bff,
+}
+
+impl VideoFieldOrder {
+    /// `Tff` when `top_field_first`, else `Bff` — the mapping from a decoded
+    /// frame's `top_field_first()` flag.
+    pub fn from_top_field_first(top_field_first: bool) -> Self {
+        if top_field_first {
+            VideoFieldOrder::Tff
+        } else {
+            VideoFieldOrder::Bff
+        }
+    }
+
+    /// Whether the top field is temporally first.
+    pub fn is_top_field_first(self) -> bool {
+        self == VideoFieldOrder::Tff
+    }
+}
+
 /// Configuration for a single video encoder instance.
 #[derive(Debug, Clone)]
 pub struct VideoEncoderConfig {
@@ -605,6 +683,30 @@ pub struct VideoEncoderConfig {
     /// `async_depth` frames of latency, not A/V skew. Clamped to 16 at
     /// open; other backends ignore the field.
     pub async_depth: u32,
+    /// Code interlaced pictures as fields, in this order. `None` (the
+    /// default) is progressive frame coding — the historical behaviour, and
+    /// what every existing caller gets.
+    ///
+    /// `Some(_)` sets `AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME`
+    /// and `AVCodecContext.field_order` before open and stamps
+    /// `AV_FRAME_FLAG_INTERLACED` (+ `TOP_FIELD_FIRST` for `Tff`) on every
+    /// frame handed to the encoder, which is what libx264 (MBAFF, with
+    /// `pic_struct` in the picture-timing SEI), `h264_nvenc` (field mode) and
+    /// `h264_qsv` (`MFX_PICSTRUCT_FIELD_*`) read. Only those three backends
+    /// can do it ([`VideoEncoderCodec::supports_field_coding`]); on any other
+    /// the open fails with [`VideoEncoderError::FieldCodingUnsupported`], so a
+    /// resolver chain falls through to one that can rather than silently
+    /// coding progressive. The frames must carry both fields woven, at the
+    /// frame (not field) rate — never scale a woven frame vertically first.
+    pub field_order: Option<VideoFieldOrder>,
+    /// Sample (pixel) aspect ratio signalled in the VUI, as `(num, den)`.
+    /// `None` (the default) leaves `AVCodecContext.sample_aspect_ratio` at
+    /// libavcodec's "unspecified" `0/1` — the historical behaviour, under
+    /// which a receiver assumes square pixels. Anamorphic sources (SD 16:9 at
+    /// 720x576 is 64:45; 704x480 4:3 is 10:11) need it or they display
+    /// squeezed. Both terms must be non-zero; the pair is reduced before it
+    /// reaches the encoder.
+    pub sample_aspect_ratio: Option<(u32, u32)>,
 }
 
 impl Default for VideoEncoderConfig {
@@ -636,6 +738,8 @@ impl Default for VideoEncoderConfig {
             color_range: String::new(),
             global_header: true,
             async_depth: 0,
+            field_order: None,
+            sample_aspect_ratio: None,
         }
     }
 }
@@ -677,6 +781,12 @@ pub enum VideoEncoderError {
     ReceivePacket(i32),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// `VideoEncoderConfig::field_order` was set on a backend that cannot
+    /// code fields ([`VideoEncoderCodec::supports_field_coding`] is `false`).
+    /// Returned before any FFmpeg call, so a resolver chain can fall through
+    /// to the next candidate — or, when none can, re-open progressive.
+    #[error("{0} cannot code interlaced (field) pictures; use libx264, h264_nvenc or h264_qsv, or encode progressive")]
+    FieldCodingUnsupported(VideoEncoderCodec),
 }
 
 // ── Video error types ──────────────────────────────────────────────────
@@ -793,4 +903,72 @@ pub enum VideoError {
     /// 12-bit on iHD, which only supports 4:2:0/4:2:2 10-bit).
     #[error("VAAPI pixel format not advertised by the decoder")]
     HwFormatUnavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_ENCODERS: [VideoEncoderCodec; 10] = [
+        VideoEncoderCodec::X264,
+        VideoEncoderCodec::X265,
+        VideoEncoderCodec::H264Nvenc,
+        VideoEncoderCodec::HevcNvenc,
+        VideoEncoderCodec::H264Qsv,
+        VideoEncoderCodec::HevcQsv,
+        VideoEncoderCodec::H264Vaapi,
+        VideoEncoderCodec::HevcVaapi,
+        VideoEncoderCodec::H264Rkmpp,
+        VideoEncoderCodec::HevcRkmpp,
+    ];
+
+    #[test]
+    fn from_ffmpeg_name_inverts_ffmpeg_name() {
+        for codec in ALL_ENCODERS {
+            assert_eq!(
+                VideoEncoderCodec::from_ffmpeg_name(codec.ffmpeg_name()),
+                Some(codec)
+            );
+        }
+        assert_eq!(VideoEncoderCodec::from_ffmpeg_name("mjpeg"), None);
+    }
+
+    #[test]
+    fn field_coding_is_h264_on_x264_nvenc_qsv_only() {
+        // The three H.264 wrappers FFmpeg gives an interlaced tool: MBAFF on
+        // libx264, field mode on NVENC, MFX_PICSTRUCT_FIELD_* on QSV. VAAPI
+        // and RKMPP ignore AV_CODEC_FLAG_INTERLACED_DCT, and no HEVC wrapper
+        // produces field pictures — claiming support there would code
+        // progressive while the caller believed otherwise.
+        let capable: Vec<_> = ALL_ENCODERS
+            .into_iter()
+            .filter(|c| c.supports_field_coding())
+            .collect();
+        assert_eq!(
+            capable,
+            vec![
+                VideoEncoderCodec::X264,
+                VideoEncoderCodec::H264Nvenc,
+                VideoEncoderCodec::H264Qsv
+            ]
+        );
+        assert!(capable.iter().all(|c| c.family() == VideoCodec::H264));
+    }
+
+    #[test]
+    fn defaults_keep_progressive_and_unspecified_sar() {
+        // Existing callers build configs with `..Default::default()` (or the
+        // edge's literal); neither new field may change what they encode.
+        let cfg = VideoEncoderConfig::default();
+        assert_eq!(cfg.field_order, None);
+        assert_eq!(cfg.sample_aspect_ratio, None);
+    }
+
+    #[test]
+    fn field_order_from_top_field_first() {
+        assert_eq!(VideoFieldOrder::from_top_field_first(true), VideoFieldOrder::Tff);
+        assert_eq!(VideoFieldOrder::from_top_field_first(false), VideoFieldOrder::Bff);
+        assert!(VideoFieldOrder::Tff.is_top_field_first());
+        assert!(!VideoFieldOrder::Bff.is_top_field_first());
+    }
 }

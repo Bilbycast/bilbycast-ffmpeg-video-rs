@@ -15,6 +15,12 @@
 //! `VideoScaler` to `YUV420P`). The encoder expects callers to deal with
 //! colorspace / bit-depth alignment themselves.
 //!
+//! Interlaced sources are coded as fields when
+//! `VideoEncoderConfig::field_order` is set (libx264 MBAFF, h264_nvenc field
+//! mode, h264_qsv field pictures — no other backend); the frames handed in are
+//! then two fields woven together at the frame rate. Otherwise every frame is
+//! coded progressive, whatever it holds.
+//!
 //! Output: [`EncodedVideoFrame`] values carrying Annex-B NAL units, with
 //! PTS / DTS / keyframe markers. The encoder's `extradata()` holds the
 //! out-of-band SPS/PPS (or VPS/SPS/PPS for HEVC) when
@@ -29,7 +35,7 @@
 use libffmpeg_video_sys::*;
 use video_codec::{
     EncodedVideoFrame, VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoEncoderError,
-    VideoRateControl,
+    VideoFieldOrder, VideoRateControl,
 };
 
 use crate::vaapi::VaapiDevice;
@@ -105,6 +111,55 @@ pub struct VideoEncoder {
     qsv_ring: Vec<*mut AVFrame>,
     /// Next `qsv_ring` slot to pack into.
     qsv_ring_idx: usize,
+    /// Field order stamped on every submitted frame, when the encoder was
+    /// opened for field coding (`VideoEncoderConfig::field_order`). `None`
+    /// = progressive; the per-frame interlace flags are then cleared.
+    field_order: Option<VideoFieldOrder>,
+    /// Sample aspect ratio signalled in the VUI, reduced. `None` =
+    /// unspecified.
+    sample_aspect_ratio: Option<(u32, u32)>,
+}
+
+/// Greatest common divisor, for reducing a sample aspect ratio.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Validate and reduce `VideoEncoderConfig::sample_aspect_ratio`. Both terms
+/// must be non-zero and, reduced, fit the 16-bit `sar_width` / `sar_height`
+/// of the H.264 / HEVC VUI.
+fn reduce_sar(num: u32, den: u32) -> Result<(u32, u32), VideoEncoderError> {
+    if num == 0 || den == 0 {
+        return Err(VideoEncoderError::InvalidInput(format!(
+            "sample_aspect_ratio {num}:{den} has a zero term (leave it unset for 'unspecified')"
+        )));
+    }
+    let g = gcd(num as u64, den as u64);
+    let (n, d) = ((num as u64 / g) as u32, (den as u64 / g) as u32);
+    if n > 65_535 || d > 65_535 {
+        return Err(VideoEncoderError::InvalidInput(format!(
+            "sample_aspect_ratio {num}:{den} reduces to {n}:{d}, which does not fit the 16-bit VUI fields"
+        )));
+    }
+    Ok((n, d))
+}
+
+/// Mark `frame` as progressive, or as interlaced in `order`: the
+/// `AV_FRAME_FLAG_INTERLACED` / `AV_FRAME_FLAG_TOP_FIELD_FIRST` bits libx264
+/// (`b_tff`, re-read per frame), h264_nvenc (`pictureStruct`) and h264_qsv
+/// (`PicStruct`) read. Other flag bits are left alone.
+unsafe fn stamp_field_flags(frame: *mut AVFrame, order: Option<VideoFieldOrder>) {
+    let mask = (AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST) as i32;
+    (*frame).flags &= !mask;
+    if let Some(order) = order {
+        (*frame).flags |= AV_FRAME_FLAG_INTERLACED as i32;
+        if order.is_top_field_first() {
+            (*frame).flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST as i32;
+        }
+    }
 }
 
 /// Resolve `(chroma, bit_depth)` to an FFmpeg `AVPixelFormat`. Returns
@@ -281,6 +336,19 @@ impl VideoEncoder {
     /// is present but the vendored FFmpeg fails to locate the encoder
     /// at runtime (unusual — usually indicates a broken build).
     pub fn open(config: &VideoEncoderConfig) -> Result<Self, VideoEncoderError> {
+        // Field coding: refuse a backend that cannot do it before anything
+        // else — it is a property of the backend, not of this build or host —
+        // with a dedicated error, so a resolver chain falls through to one
+        // that can instead of silently coding progressive (VAAPI and RKMPP
+        // ignore AV_CODEC_FLAG_INTERLACED_DCT; no HEVC wrapper codes fields).
+        if config.field_order.is_some() && !config.codec.supports_field_coding() {
+            return Err(VideoEncoderError::FieldCodingUnsupported(config.codec));
+        }
+        let sample_aspect_ratio = match config.sample_aspect_ratio {
+            Some((n, d)) => Some(reduce_sar(n, d)?),
+            None => None,
+        };
+
         // Compile-time gate: refuse to even try opening a backend the
         // build was configured to omit.
         match config.codec {
@@ -378,6 +446,20 @@ impl VideoEncoder {
             return Err(VideoEncoderError::InvalidInput(
                 "width and height must be non-zero".into(),
             ));
+        }
+        // Each field of a 4:2:0 frame needs an even number of luma rows (so
+        // a whole number of chroma rows), i.e. a frame height divisible by 4;
+        // 4:2:2 / 4:4:4 fields only need the frame height to be even.
+        // libx264 refuses otherwise with an opaque AVERROR_EXTERNAL.
+        if config.field_order.is_some() {
+            let multiple = if config.chroma == VideoChroma::Yuv420 { 4 } else { 2 };
+            if !config.height.is_multiple_of(multiple) {
+                return Err(VideoEncoderError::InvalidInput(format!(
+                    "interlaced encode needs a frame height divisible by {multiple} for {}, got {}",
+                    config.chroma.as_str(),
+                    config.height
+                )));
+            }
         }
         if config.fps_num == 0 || config.fps_den == 0 {
             return Err(VideoEncoderError::InvalidInput(
@@ -477,6 +559,35 @@ impl VideoEncoder {
             (*ctx).framerate.den = config.fps_den as i32;
             (*ctx).gop_size = config.gop_size as i32;
             (*ctx).max_b_frames = config.max_b_frames as i32;
+
+            // Field coding (see `VideoEncoderConfig::field_order`). The
+            // flags are what the wrappers read — libx264 `b_interlaced`
+            // (MBAFF; x264 then turns on `pic_struct` in the picture-timing
+            // SEI by itself, and follows the per-frame TOP_FIELD_FIRST flag
+            // for `b_tff` by reconfiguring, so no `x264-params` are needed),
+            // nvenc `frameFieldMode`, qsvenc `PicStruct` + 32-line height
+            // alignment. `field_order` is the container-level statement of
+            // the same thing. Progressive leaves both at libavcodec's
+            // defaults, as before.
+            if let Some(order) = config.field_order {
+                (*ctx).flags |=
+                    (AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME) as i32;
+                (*ctx).field_order = if order.is_top_field_first() {
+                    AVFieldOrder_AV_FIELD_TT
+                } else {
+                    AVFieldOrder_AV_FIELD_BB
+                };
+            }
+            // Sample aspect ratio → VUI `aspect_ratio_idc` / `sar_*`. Read at
+            // open by libx264 (and re-read per frame), libx265, nvenc, qsvenc
+            // and the VAAPI H.264 / HEVC header writers. Unset keeps
+            // libavcodec's 0/1 ("unspecified"), as before.
+            if let Some((num, den)) = sample_aspect_ratio {
+                (*ctx).sample_aspect_ratio = AVRational {
+                    num: num as i32,
+                    den: den as i32,
+                };
+            }
 
             // VAAPI: open the hwdevice + allocate encoder-side
             // `hw_frames_ctx` BEFORE `avcodec_open2`. The decoder lazy-
@@ -1006,8 +1117,40 @@ impl VideoEncoder {
                 sw_frame,
                 qsv_ring,
                 qsv_ring_idx: 0,
+                field_order: config.field_order,
+                sample_aspect_ratio,
             })
         }
+    }
+
+    /// Field order the encoder codes, or `None` for progressive — what it
+    /// was opened with, as updated by [`Self::set_frame_field_order`].
+    pub fn field_order(&self) -> Option<VideoFieldOrder> {
+        self.field_order
+    }
+
+    /// Change the field order stamped on subsequent frames — for a source
+    /// switch from a TFF to a BFF feed (or back) without reopening. Only an
+    /// encoder opened for field coding can change it: progressive vs.
+    /// interlaced is fixed at open (`AV_CODEC_FLAG_INTERLACED_DCT`), so a
+    /// progressive encoder returns `InvalidInput`.
+    pub fn set_frame_field_order(
+        &mut self,
+        order: VideoFieldOrder,
+    ) -> Result<(), VideoEncoderError> {
+        if self.field_order.is_none() {
+            return Err(VideoEncoderError::InvalidInput(
+                "encoder was opened progressive; field coding is fixed at open".into(),
+            ));
+        }
+        self.field_order = Some(order);
+        Ok(())
+    }
+
+    /// Sample aspect ratio the encoder signals, reduced, or `None` when
+    /// unspecified.
+    pub fn sample_aspect_ratio(&self) -> Option<(u32, u32)> {
+        self.sample_aspect_ratio
     }
 
     /// Chroma subsampling the encoder was opened with.
@@ -1193,6 +1336,7 @@ impl VideoEncoder {
 
         (*self.frame).pts = pts.unwrap_or(self.frame_count);
         self.frame_count = (*self.frame).pts + 1;
+        stamp_field_flags(self.frame, self.field_order);
 
         // One-shot IDR request: libx264 / libx265 / NVENC all honour
         // `pict_type = I` by emitting an IDR for that frame. Required
@@ -1316,6 +1460,10 @@ impl VideoEncoder {
 
         (*frame).pts = pts.unwrap_or(self.frame_count);
         self.frame_count = (*frame).pts + 1;
+        // qsvenc derives the surface PicStruct from these per-frame flags; an
+        // interlaced session fed an unflagged frame codes it progressive
+        // (and logs MFX_WRN_INCOMPATIBLE_VIDEO_PARAM).
+        stamp_field_flags(frame, self.field_order);
 
         if self.force_idr_next {
             (*frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
@@ -1431,6 +1579,7 @@ impl VideoEncoder {
         }
 
         (*self.frame).pts = frame_pts;
+        stamp_field_flags(self.frame, self.field_order);
         if self.force_idr_next {
             (*self.frame).pict_type = AVPictureType_AV_PICTURE_TYPE_I;
             self.force_idr_next = false;
@@ -2014,6 +2163,269 @@ mod tests {
             piped_fps >= sync_fps * 0.95,
             "pipelined must not be slower: sync {sync_fps:.1} fps vs piped {piped_fps:.1} fps"
         );
+    }
+
+    #[test]
+    fn field_order_refused_where_the_backend_cannot_code_fields() {
+        // Refused before the build gate or any FFmpeg call, with its own
+        // variant, so a resolver chain falls through (and the edge can tell
+        // "cannot interlace" from "failed to open") on every build.
+        for codec in [
+            VideoEncoderCodec::X265,
+            VideoEncoderCodec::HevcNvenc,
+            VideoEncoderCodec::HevcQsv,
+            VideoEncoderCodec::H264Vaapi,
+            VideoEncoderCodec::HevcVaapi,
+            VideoEncoderCodec::H264Rkmpp,
+            VideoEncoderCodec::HevcRkmpp,
+        ] {
+            for order in [VideoFieldOrder::Tff, VideoFieldOrder::Bff] {
+                let cfg = VideoEncoderConfig {
+                    codec,
+                    field_order: Some(order),
+                    ..Default::default()
+                };
+                assert!(
+                    matches!(
+                        VideoEncoder::open(&cfg),
+                        Err(VideoEncoderError::FieldCodingUnsupported(c)) if c == codec
+                    ),
+                    "{codec:?} {order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sample_aspect_ratio_is_validated_and_reduced() {
+        assert_eq!(reduce_sar(128, 90).unwrap(), (64, 45));
+        assert_eq!(reduce_sar(16, 11).unwrap(), (16, 11));
+        assert_eq!(reduce_sar(1, 1).unwrap(), (1, 1));
+        assert!(reduce_sar(0, 1).is_err());
+        assert!(reduce_sar(4, 0).is_err());
+        assert!(reduce_sar(65_537, 65_539).is_err(), "does not fit u16 once reduced");
+        assert_eq!(reduce_sar(65_535 * 2, 2).unwrap(), (65_535, 1));
+        // And the open path refuses a zero term on every build.
+        let cfg = VideoEncoderConfig {
+            sample_aspect_ratio: Some((0, 1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            VideoEncoder::open(&cfg),
+            Err(VideoEncoderError::InvalidInput(_))
+        ));
+    }
+
+    /// Encode `n` frames of a moving luma ramp with x264 (in-band headers)
+    /// and return the Annex B packets.
+    #[cfg(feature = "video-encoder-x264")]
+    fn x264_packets(cfg: &VideoEncoderConfig, n: usize) -> Vec<EncodedVideoFrame> {
+        let mut enc = VideoEncoder::open(cfg).expect("open x264");
+        let (w, h) = (cfg.width as usize, cfg.height as usize);
+        let mut out = Vec::new();
+        for i in 0..n {
+            let y: Vec<u8> = (0..w * h).map(|p| ((p % w + p / w + i * 7) % 220 + 16) as u8).collect();
+            let u = vec![128u8; (w / 2) * (h / 2)];
+            let v = vec![128u8; (w / 2) * (h / 2)];
+            out.extend(enc.encode_frame(&y, w, &u, w / 2, &v, w / 2, None).expect("encode"));
+        }
+        out.extend(enc.flush().expect("flush"));
+        out
+    }
+
+    /// `(interlaced, top_field_first, sample_aspect_ratio)` of one decoded
+    /// frame.
+    #[cfg(feature = "video-encoder-x264")]
+    type FrameShape = (bool, bool, Option<(u32, u32)>);
+
+    /// Decode Annex B packets and return each decoded frame's
+    /// [`FrameShape`].
+    #[cfg(feature = "video-encoder-x264")]
+    fn decoded_field_flags(packets: &[EncodedVideoFrame]) -> Vec<FrameShape> {
+        use crate::decoder::VideoDecoder;
+        use video_codec::VideoCodec;
+        let mut dec = VideoDecoder::open(VideoCodec::H264).unwrap();
+        let mut out = Vec::new();
+        let drain = |dec: &mut VideoDecoder, out: &mut Vec<_>| {
+            while let Ok(f) = dec.receive_frame() {
+                out.push((f.is_interlaced(), f.top_field_first(), f.sample_aspect_ratio()));
+            }
+        };
+        for p in packets {
+            dec.send_packet(&p.data).unwrap();
+            drain(&mut dec, &mut out);
+        }
+        dec.send_flush().unwrap();
+        drain(&mut dec, &mut out);
+        out
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    fn interlace_cfg(order: Option<VideoFieldOrder>) -> VideoEncoderConfig {
+        VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: 320,
+            height: 240,
+            fps_num: 25,
+            fps_den: 1,
+            bitrate_kbps: 800,
+            gop_size: 25,
+            global_header: false,
+            field_order: order,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_field_order_codes_mbaff_with_pic_struct() {
+        for order in [VideoFieldOrder::Tff, VideoFieldOrder::Bff] {
+            let packets = x264_packets(&interlace_cfg(Some(order)), 6);
+            let sps = crate::h264_sps::find_h264_sps(&packets[0].data).expect("in-band SPS");
+            // frame_mbs_only_flag = 0 + MBAFF: the stream codes fields.
+            assert!(!sps.frame_mbs_only, "{order:?}: frame_mbs_only_flag must be 0");
+            assert!(sps.mb_adaptive_frame_field, "{order:?}: libx264 interlace is MBAFF");
+            // pic_struct in the picture-timing SEI tells the IRD to display
+            // two fields in order. libx264 turns it on for interlaced by
+            // itself; this pins that for the x264 build the release links.
+            assert!(sps.pic_struct_present, "{order:?}: pic_struct_present_flag");
+            assert_eq!((sps.width, sps.height), (320, 240));
+
+            let frames = decoded_field_flags(&packets);
+            assert_eq!(frames.len(), 6);
+            for (interlaced, tff, _) in frames {
+                assert!(interlaced, "{order:?}: decoder must see interlaced frames");
+                assert_eq!(tff, order.is_top_field_first(), "{order:?}: field order");
+            }
+        }
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_progressive_default_is_unchanged() {
+        let packets = x264_packets(&interlace_cfg(None), 4);
+        let sps = crate::h264_sps::find_h264_sps(&packets[0].data).unwrap();
+        assert!(sps.frame_mbs_only);
+        assert!(!sps.pic_struct_present);
+        assert_eq!(sps.sample_aspect_ratio, None, "no SAR asked for, none signalled");
+        for (interlaced, _, sar) in decoded_field_flags(&packets) {
+            assert!(!interlaced);
+            assert_eq!(sar, None);
+        }
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_cbr_interlaced_keeps_hrd_and_fields() {
+        // CBR's `x264-params nal-hrd=cbr` and field coding must coexist.
+        let cfg = VideoEncoderConfig {
+            rate_control: VideoRateControl::Cbr,
+            ..interlace_cfg(Some(VideoFieldOrder::Tff))
+        };
+        let packets = x264_packets(&cfg, 3);
+        let sps = crate::h264_sps::find_h264_sps(&packets[0].data).unwrap();
+        assert!(sps.nal_hrd_present, "nal-hrd=cbr survived");
+        assert!(sps.pic_struct_present && !sps.frame_mbs_only, "field coding survived");
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_signals_sample_aspect_ratio() {
+        for (asked, signalled) in [((64, 45), (64, 45)), ((128, 90), (64, 45)), ((16, 11), (16, 11))] {
+            let cfg = VideoEncoderConfig {
+                sample_aspect_ratio: Some(asked),
+                ..interlace_cfg(None)
+            };
+            let enc = VideoEncoder::open(&cfg).unwrap();
+            assert_eq!(enc.sample_aspect_ratio(), Some(signalled));
+            drop(enc);
+            let packets = x264_packets(&cfg, 2);
+            let sps = crate::h264_sps::find_h264_sps(&packets[0].data).unwrap();
+            assert_eq!(
+                sps.sample_aspect_ratio.map(|(n, d)| (n as u32, d as u32)),
+                Some(signalled),
+                "VUI SAR for {asked:?}"
+            );
+            for (_, _, sar) in decoded_field_flags(&packets) {
+                assert_eq!(sar, Some(signalled), "decoded frame SAR for {asked:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_global_header_extradata_carries_the_interlaced_sps() {
+        let cfg = VideoEncoderConfig {
+            global_header: true,
+            sample_aspect_ratio: Some((64, 45)),
+            ..interlace_cfg(Some(VideoFieldOrder::Tff))
+        };
+        let enc = VideoEncoder::open(&cfg).unwrap();
+        let sps = crate::h264_sps::find_h264_sps(enc.extradata().expect("extradata")).unwrap();
+        assert!(!sps.frame_mbs_only && sps.mb_adaptive_frame_field && sps.pic_struct_present);
+        assert_eq!(sps.sample_aspect_ratio, Some((64, 45)));
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn x264_field_order_follows_the_source_mid_stream() {
+        let cfg = interlace_cfg(Some(VideoFieldOrder::Tff));
+        let mut enc = VideoEncoder::open(&cfg).unwrap();
+        assert_eq!(enc.field_order(), Some(VideoFieldOrder::Tff));
+        let (w, h) = (320usize, 240usize);
+        let u = vec![128u8; (w / 2) * (h / 2)];
+        let mut packets = Vec::new();
+        for i in 0..8 {
+            if i == 4 {
+                enc.set_frame_field_order(VideoFieldOrder::Bff).unwrap();
+            }
+            let y: Vec<u8> = (0..w * h).map(|p| ((p + i * 13) % 200 + 16) as u8).collect();
+            packets.extend(enc.encode_frame(&y, w, &u, w / 2, &u, w / 2, None).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        let tff: Vec<bool> = decoded_field_flags(&packets).iter().map(|f| f.1).collect();
+        assert_eq!(tff, [true, true, true, true, false, false, false, false]);
+
+        // Progressive is fixed at open.
+        let mut prog = VideoEncoder::open(&interlace_cfg(None)).unwrap();
+        assert!(prog.set_frame_field_order(VideoFieldOrder::Tff).is_err());
+        assert_eq!(prog.field_order(), None);
+    }
+
+    #[cfg(feature = "video-encoder-x264")]
+    #[test]
+    fn interlaced_height_must_split_into_whole_chroma_fields() {
+        let cfg = VideoEncoderConfig {
+            height: 242,
+            ..interlace_cfg(Some(VideoFieldOrder::Tff))
+        };
+        assert!(matches!(
+            VideoEncoder::open(&cfg),
+            Err(VideoEncoderError::InvalidInput(_))
+        ));
+        // Progressive 242 is fine, as before.
+        assert!(VideoEncoder::open(&VideoEncoderConfig { height: 242, ..interlace_cfg(None) }).is_ok());
+    }
+
+    #[test]
+    fn field_coding_probe() {
+        use crate::probe::{probe_open_encoder_field_coding, ProbeError};
+        for name in ["libx265", "hevc_nvenc", "h264_vaapi", "h264_rkmpp", "mjpeg", "nonsense"] {
+            assert!(
+                matches!(probe_open_encoder_field_coding(name), Err(ProbeError::NotCompiled)),
+                "{name}"
+            );
+        }
+        let x264 = probe_open_encoder_field_coding("libx264");
+        if cfg!(feature = "video-encoder-x264") {
+            assert!(x264.is_ok(), "libx264 always codes fields: {x264:?}");
+        } else {
+            assert!(matches!(x264, Err(ProbeError::NotCompiled)));
+        }
+        // Host-dependent: report, do not assert.
+        for name in ["h264_nvenc", "h264_qsv"] {
+            eprintln!("field-coding probe {name}: {:?}", probe_open_encoder_field_coding(name));
+        }
     }
 
     #[cfg(feature = "video-encoder-x264")]

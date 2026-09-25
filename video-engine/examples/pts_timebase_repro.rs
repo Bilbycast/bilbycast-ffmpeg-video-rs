@@ -70,6 +70,8 @@ fn run(good: bool) {
         color_range: String::new(),
         global_header: false,
         async_depth: 0,
+        field_order: None,
+        sample_aspect_ratio: None,
     };
 
     let mut enc = video_engine::VideoEncoder::open(&cfg).expect("open x264");

@@ -306,6 +306,16 @@ impl DecodedFrame {
         unsafe { ((*self.frame).flags & AV_FRAME_FLAG_TOP_FIELD_FIRST as i32) != 0 }
     }
 
+    /// Sample (pixel) aspect ratio of this frame as `(num, den)`, from the
+    /// bitstream's VUI / sequence header. `None` when unspecified (`0/1`) —
+    /// treat as square pixels. An anamorphic SD source reports e.g.
+    /// `(64, 45)` (720x576 16:9) or `(10, 11)` (704x480 4:3); an encoder fed
+    /// this frame must signal it (`VideoEncoderConfig::sample_aspect_ratio`)
+    /// or the output displays squeezed.
+    pub fn sample_aspect_ratio(&self) -> Option<(u32, u32)> {
+        unsafe { rational_to_sar((*self.frame).sample_aspect_ratio) }
+    }
+
     /// Per-frame PTS in the timebase the caller supplied to
     /// [`VideoDecoder::send_packet_with_pts`]. FFmpeg propagates the
     /// input packet's PTS through the decoder's internal reorder
@@ -778,6 +788,10 @@ impl DecodedFrame {
             (*dst).color_range = (*self.frame).color_range;
             (*dst).color_trc = (*self.frame).color_trc;
             (*dst).color_primaries = (*self.frame).color_primaries;
+            // Sample aspect ratio: a caller that configures an encoder
+            // from the downloaded frame reads it to signal SAR, and an
+            // anamorphic source loses its shape without it.
+            (*dst).sample_aspect_ratio = (*self.frame).sample_aspect_ratio;
             // Propagate the keyframe marker via the AV_FRAME_FLAG_KEY bit
             // (AVFrame.key_frame was removed in FFmpeg 8.0), and the
             // interlace markers — the display path's deinterlace
@@ -819,6 +833,16 @@ impl DecodedFrame {
         } else {
             sum as f64 / count as f64
         }
+    }
+}
+
+/// `AVRational` sample aspect ratio → `Some((num, den))`, or `None` for
+/// libavcodec's "unspecified" (`0/1`, or any non-positive term).
+fn rational_to_sar(r: AVRational) -> Option<(u32, u32)> {
+    if r.num > 0 && r.den > 0 {
+        Some((r.num as u32, r.den as u32))
+    } else {
+        None
     }
 }
 
@@ -1124,6 +1148,16 @@ impl VideoDecoder {
     #[doc(hidden)]
     pub fn active_thread_type(&self) -> i32 {
         unsafe { (*self.ctx).active_thread_type }
+    }
+
+    /// Sample aspect ratio the decoder has parsed from the bitstream (the
+    /// H.264 / HEVC VUI or the MPEG-2 sequence header), as `(num, den)`.
+    /// `None` until a header has been decoded, and when the stream leaves it
+    /// unspecified. Prefer [`DecodedFrame::sample_aspect_ratio`] on the
+    /// frame being encoded; this is the fallback when that frame carries
+    /// none.
+    pub fn sample_aspect_ratio(&self) -> Option<(u32, u32)> {
+        unsafe { rational_to_sar((*self.ctx).sample_aspect_ratio) }
     }
 
     /// Opt in to zero-copy RKMPP display output: `receive_frame()`
