@@ -7,4 +7,4 @@ description = "Pure Rust types for video codec configuration, errors, and frame 
 publish = false
 
 [dependencies]
-thiserror = "2.0.20"
+thiserror = "2.0.21"
