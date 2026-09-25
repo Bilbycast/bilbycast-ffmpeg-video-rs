@@ -74,7 +74,7 @@ impl ScaledFrame {
                     | ScalerDstFormat::Yuv420p8
                     | ScalerDstFormat::Yuv420p10le,
                     1 | 2,
-                ) => (height + 1) / 2,
+                ) => height.div_ceil(2),
                 _ => height,
             };
             let slice = std::slice::from_raw_parts(data, linesize * plane_rows);
@@ -379,15 +379,6 @@ impl VideoScaler {
         }
     }
 
-    /// Like [`Self::scale_into_packed`] but takes raw planar YUV slices
-    /// instead of a [`DecodedFrame`]. Used by the display sink, which
-    /// already moves planes through an mpsc channel and doesn't have a
-    /// live [`DecodedFrame`] handle by the time the blit runs.
-    ///
-    /// `src_w` / `src_h` / `src_format` describe the source planes and
-    /// must agree with what the scaler was constructed for. The
-    /// destination format must be packed (currently `Bgra8`).
-    #[allow(clippy::too_many_arguments)]
     /// Is `dst` big enough for a packed write of `dst_width x dst_height` at
     /// `dst_pitch`?
     ///
@@ -432,6 +423,16 @@ impl VideoScaler {
         Ok(())
     }
 
+    /// Like [`Self::scale_into_packed`] but takes raw planar YUV slices
+    /// instead of a [`DecodedFrame`]. Used by the display sink, which
+    /// already moves planes through an mpsc channel and doesn't have a
+    /// live [`DecodedFrame`] handle by the time the blit runs.
+    ///
+    /// `src_w` / `src_h` / `src_format` describe the source planes and
+    /// must agree with what the scaler was constructed for. The
+    /// destination format must be packed (currently `Bgra8`).
+    // Public API mirroring sws_scale's per-plane data/stride arrays.
+    #[allow(clippy::too_many_arguments)]
     pub fn scale_raw_planes_into_packed(
         &self,
         src_w: u32,
@@ -474,7 +475,7 @@ impl VideoScaler {
                 src_linesize.as_ptr(),
                 0,
                 src_h as i32,
-                dst_data.as_ptr() as *const *mut u8,
+                dst_data.as_ptr(),
                 dst_linesize.as_ptr(),
             );
         }
@@ -545,7 +546,7 @@ impl VideoScaler {
                 src_linesize.as_ptr(),
                 0,
                 src_h as i32,
-                dst_data.as_ptr() as *const *mut u8,
+                dst_data.as_ptr(),
                 dst_linesize.as_ptr(),
             );
         }
@@ -582,7 +583,7 @@ impl VideoScaler {
                 (*src_frame).linesize.as_ptr(),
                 0,
                 (*src_frame).height,
-                dst_data.as_ptr() as *const *mut u8,
+                dst_data.as_ptr(),
                 dst_linesize.as_ptr(),
             );
         }

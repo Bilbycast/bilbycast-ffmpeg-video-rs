@@ -35,7 +35,7 @@ fn main() {
     ];
 
     println!("Encoders:");
-    println!("  {:<20} {:<14} {}", "name", "compiled-in", "runtime open");
+    println!("  {:<20} {:<14} runtime open", "name", "compiled-in");
     println!("  {}", "-".repeat(70));
     for name in encoders {
         let compiled = is_encoder_available(name);
@@ -60,7 +60,7 @@ fn main() {
     ];
 
     println!("\nDecoders:");
-    println!("  {:<20} {:<14} {}", "name", "compiled-in", "runtime open");
+    println!("  {:<20} {:<14} runtime open", "name", "compiled-in");
     println!("  {}", "-".repeat(70));
     for name in decoders {
         let compiled = is_decoder_available(name);

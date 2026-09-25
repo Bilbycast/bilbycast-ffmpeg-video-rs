@@ -88,9 +88,7 @@ impl AudioDecoder {
                 AudioDecoderCodec::Opus => {
                     // libopus has higher quality than the FFmpeg native
                     // Opus decoder; both are LGPL-clean.
-                    let by_name = avcodec_find_decoder_by_name(
-                        b"libopus\0".as_ptr() as *const std::os::raw::c_char,
-                    );
+                    let by_name = avcodec_find_decoder_by_name(c"libopus".as_ptr());
                     if by_name.is_null() {
                         avcodec_find_decoder(AVCodecID_AV_CODEC_ID_OPUS)
                     } else {

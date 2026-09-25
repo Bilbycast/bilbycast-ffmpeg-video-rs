@@ -535,7 +535,7 @@ impl VideoEncoder {
             // like 1 (synchronous). Clamp the top so a wild config value
             // can't make libmfx allocate an absurd surface pool.
             let qsv_async_depth: u32 = if is_qsv {
-                config.async_depth.max(1).min(16)
+                config.async_depth.clamp(1, 16)
             } else {
                 1
             };
@@ -1079,6 +1079,8 @@ impl VideoEncoder {
     /// `pts`, when `Some`, fixes the frame's presentation timestamp in
     /// the encoder time base (1 / fps_num). When `None`, the encoder
     /// counts frames monotonically from zero.
+    // Public API: three planes + strides mirror AVFrame's data/linesize layout.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_frame(
         &mut self,
         y: &[u8],
@@ -1168,6 +1170,8 @@ impl VideoEncoder {
     /// SW encode path: copy three planar Y/U/V planes into the
     /// pre-allocated `self.frame` buffer and send straight to the
     /// encoder. Used by libx264 / libx265 / NVENC / QSV.
+    // Takes `encode_frame`'s AVFrame-shaped plane/stride args, like its siblings.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame_sw(
         &mut self,
         y: &[u8],
@@ -1337,6 +1341,8 @@ impl VideoEncoder {
     /// formats expect — `YUV420P10LE` / `YUV422P10LE` source samples
     /// store valid bits in the lower 10 of a 16-bit word, P010 / P210
     /// surfaces expect them in the upper 10 (the lower 6 zeroed).
+    // Takes `encode_frame`'s AVFrame-shaped plane/stride args, like its siblings.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame_vaapi(
         &mut self,
         y: &[u8],
@@ -1581,6 +1587,8 @@ unsafe fn copy_plane_10bit_lo_to_hi(
 /// divided by 2 for both 4:2:0 and 4:2:2 — VAAPI's
 /// horizontal-subsampling shape). `rows` is the chroma plane height
 /// (`H/2` for 4:2:0, `H` for 4:2:2).
+// Raw AVFrame plane pointer + linesize alongside the source planes/strides.
+#[allow(clippy::too_many_arguments)]
 unsafe fn interleave_uv_10bit_lo_to_hi(
     dst: *mut u8,
     dst_stride: i32,
@@ -1616,6 +1624,8 @@ unsafe fn interleave_uv_10bit_lo_to_hi(
 ///
 /// 8-bit only — the 10-bit P010 / P210 path lives in
 /// [`interleave_uv_10bit_lo_to_hi`].
+// Raw AVFrame plane pointer + linesize alongside the source planes/strides.
+#[allow(clippy::too_many_arguments)]
 unsafe fn interleave_uv_8bit(
     dst: *mut u8,
     dst_stride: i32,
@@ -1954,7 +1964,7 @@ mod tests {
         let u = vec![128u8; (W / 2) * (H / 2)];
         let v = vec![128u8; (W / 2) * (H / 2)];
 
-        let mut run = |depth: u32| -> Option<f64> {
+        let run = |depth: u32| -> Option<f64> {
             let cfg = VideoEncoderConfig {
                 codec: VideoEncoderCodec::HevcQsv,
                 width: W as u32,

@@ -106,6 +106,16 @@ const AVERROR_EAGAIN: i32 = -35; // macOS EAGAIN = 35
 #[cfg(not(target_os = "macos"))]
 const AVERROR_EAGAIN: i32 = -11; // Linux EAGAIN = 11
 
+/// Three-plane view returned by [`DecodedFrame::yuv_planes`]:
+/// `(y, y_stride, u, u_stride, v, v_stride)`, strides in bytes.
+pub type YuvPlanes<'a> = (&'a [u8], usize, &'a [u8], usize, &'a [u8], usize);
+
+/// Semi-planar 16-bit view returned by [`DecodedFrame::p01x_planes`] and
+/// [`DecodedFrame::p21x_planes`]: `(y, y_stride, uv, uv_stride,
+/// planar_pix_fmt)`, strides in bytes, with `planar_pix_fmt` the planar
+/// `AVPixelFormat` a deinterleaved copy should be tagged with.
+pub type SemiPlanar16Planes<'a> = (&'a [u8], usize, &'a [u8], usize, i32);
+
 /// A decoded video frame. Wraps an `AVFrame` with accessor methods.
 ///
 /// The frame data is owned by the decoder's internal reference-counted
@@ -239,7 +249,7 @@ impl DecodedFrame {
     /// Returns `None` for non-planar formats and for any format we
     /// haven't taught the chroma-height table about — better to surface
     /// "format unsupported here" than to over-read silently.
-    pub fn yuv_planes(&self) -> Option<(&[u8], usize, &[u8], usize, &[u8], usize)> {
+    pub fn yuv_planes(&self) -> Option<YuvPlanes<'_>> {
         unsafe {
             let frame = &*self.frame;
             let y_ptr = frame.data[0];
@@ -368,7 +378,7 @@ impl DecodedFrame {
     /// deinterleave needs to copy 2 bytes per sample instead of 1.
     ///
     /// Returns `None` for any other format.
-    pub fn p01x_planes(&self) -> Option<(&[u8], usize, &[u8], usize, i32)> {
+    pub fn p01x_planes(&self) -> Option<SemiPlanar16Planes<'_>> {
         unsafe {
             let frame = &*self.frame;
             let planar_pix_fmt = if frame.format == AVPixelFormat_AV_PIX_FMT_P010LE {
@@ -453,7 +463,7 @@ impl DecodedFrame {
     /// Produced by NVDEC / QSV / VAAPI for HEVC 4:2:2 10-bit / 12-bit
     /// sources — the typical HEVC contribution profile in modern UHD
     /// broadcast.
-    pub fn p21x_planes(&self) -> Option<(&[u8], usize, &[u8], usize, i32)> {
+    pub fn p21x_planes(&self) -> Option<SemiPlanar16Planes<'_>> {
         unsafe {
             let frame = &*self.frame;
             let planar_pix_fmt = if frame.format == AVPixelFormat_AV_PIX_FMT_P210LE {

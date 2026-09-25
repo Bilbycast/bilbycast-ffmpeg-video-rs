@@ -581,6 +581,9 @@ fn probe_pix_fmt_for_chroma(name: &str, chroma: ProbeChroma) -> Option<AVPixelFo
                 Some(AVPixelFormat_AV_PIX_FMT_YUV420P10LE)
             }
         }
+        // One branch per backend on purpose: each `None` records that
+        // backend's own reason, mirroring the table in the doc comment.
+        #[allow(clippy::if_same_then_else)]
         ProbeChroma::Yuv422_10bit => {
             if is_rkmpp {
                 None // RKMPP: neither 4:2:2 nor 10-bit

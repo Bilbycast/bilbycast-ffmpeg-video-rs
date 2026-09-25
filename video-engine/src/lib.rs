@@ -49,7 +49,7 @@ pub use video_encoder::VideoEncoder;
 /// Silence FFmpeg's internal logging. Call once at startup.
 pub fn silence_ffmpeg_logs() {
     unsafe {
-        libffmpeg_video_sys::av_log_set_level(libffmpeg_video_sys::AV_LOG_QUIET as i32);
+        libffmpeg_video_sys::av_log_set_level(libffmpeg_video_sys::AV_LOG_QUIET);
     }
 }
 

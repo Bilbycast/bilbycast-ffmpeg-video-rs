@@ -55,7 +55,7 @@ impl AudioEncoder {
             let codec_ptr = match config.codec {
                 AudioCodecType::Opus => {
                     // Use libopus encoder (higher quality than FFmpeg native)
-                    avcodec_find_encoder_by_name(b"libopus\0".as_ptr() as *const std::os::raw::c_char)
+                    avcodec_find_encoder_by_name(c"libopus".as_ptr())
                 }
                 AudioCodecType::Mp2 => {
                     avcodec_find_encoder(AVCodecID_AV_CODEC_ID_MP2)
@@ -97,7 +97,7 @@ impl AudioEncoder {
             }
 
             // Allow experimental codecs
-            (*ctx).strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL as i32;
+            (*ctx).strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
 
             let ret = avcodec_open2(ctx, codec_ptr, std::ptr::null_mut());
             if ret < 0 {
@@ -213,12 +213,13 @@ impl AudioEncoder {
                 }
                 x if x == AVSampleFormat_AV_SAMPLE_FMT_FLTP => {
                     // Planar f32: each channel in its own data[ch] plane
-                    for ch in 0..self.channels as usize {
+                    // `planar.len() == self.channels` is checked on entry.
+                    for (ch, plane) in planar.iter().enumerate() {
                         let dst = std::slice::from_raw_parts_mut(
                             (*self.frame).data[ch] as *mut f32,
                             samples_per_channel,
                         );
-                        dst.copy_from_slice(&planar[ch]);
+                        dst.copy_from_slice(plane);
                     }
                 }
                 x if x == AVSampleFormat_AV_SAMPLE_FMT_S16 => {
