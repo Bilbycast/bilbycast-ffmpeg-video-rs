@@ -665,7 +665,7 @@ mod tests {
         );
         // Mid-grey luma + neutral chroma: every BGR channel should
         // sit comfortably inside the mid-grey band (rough sanity).
-        for px in dst.chunks_exact(4) {
+        for px in dst.as_chunks::<4>().0 {
             let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
             assert!(
                 (60..=200).contains(&b),
